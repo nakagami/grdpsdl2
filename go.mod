@@ -1,4 +1,4 @@
-module grdpsdl2
+module github.com/nakagami/grdpsdl2
 
 go 1.24.3
 
