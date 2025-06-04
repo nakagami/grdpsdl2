@@ -53,6 +53,8 @@ func mainLoop(hostPort, domain, user, password string, width, height int) (err e
 	}
 	defer sdl.Quit()
 
+	sdl.StopTextInput()
+
 	window, err := sdl.CreateWindow("GRDPSDL2", sdl.WINDOWPOS_UNDEFINED,
 		sdl.WINDOWPOS_UNDEFINED, int32(width), int32(height), sdl.WINDOW_SHOWN)
 	if err != nil {
