@@ -37,16 +37,6 @@ func paintImage(img *image.RGBA, surface *sdl.Surface, destX, destY int) {
 	}
 }
 
-func rdpLogin(hostPort, domain, user, password string, width, height int) (error, *grdp.RdpClient) {
-	g := grdp.NewRdpClient(hostPort, width, height)
-	err := g.Login(domain, user, password)
-	if err != nil {
-		slog.Error("Login", "err", err)
-		return err, nil
-	}
-	return nil, g
-}
-
 func mainLoop(hostPort, domain, user, password string, width, height int) (err error) {
 	if err = sdl.Init(sdl.INIT_VIDEO); err != nil {
 		return err
@@ -62,7 +52,8 @@ func mainLoop(hostPort, domain, user, password string, width, height int) (err e
 	}
 	surface, _ := window.GetSurface()
 
-	err, rdpClient := rdpLogin(hostPort, domain, user, password, width, height)
+	rdpClient := grdp.NewRdpClient(hostPort, width, height)
+	err = rdpClient.Login(domain, user, password)
 	if err != nil {
 		return err
 	}
@@ -72,7 +63,11 @@ func mainLoop(hostPort, domain, user, password string, width, height int) (err e
 	}).OnReady(func() {
 		slog.Info("on ready")
 	}).OnBitmap(func(bs []grdp.Bitmap) {
-		paint_bitmap(surface, bs)
+		surface.Lock()
+		defer surface.Unlock()
+		for _, bm := range bs {
+			paintImage(bm.RGBA(), surface, bm.DestLeft, bm.DestTop)
+		}
 		window.UpdateSurface()
 	})
 
@@ -110,14 +105,6 @@ func mainLoop(hostPort, domain, user, password string, width, height int) (err e
 
 	err = window.Destroy()
 	return err
-}
-
-func paint_bitmap(surface *sdl.Surface, bs []grdp.Bitmap) {
-	surface.Lock()
-	defer surface.Unlock()
-	for _, bm := range bs {
-		paintImage(bm.RGBA(), surface, bm.DestLeft, bm.DestTop)
-	}
 }
 
 func transKey(scancode sdl.Scancode) int {
@@ -163,35 +150,35 @@ func transKey(scancode sdl.Scancode) int {
 		sdl.SCANCODE_K:            0x0025,
 		sdl.SCANCODE_L:            0x0026,
 		sdl.SCANCODE_SEMICOLON:    0x0027,
-		sdl.SCANCODE_APOSTROPHE:              0x0028,
-		sdl.SCANCODE_GRAVE: 		          0x0029,
-		sdl.SCANCODE_LSHIFT:      0x002A,
-		sdl.SCANCODE_BACKSLASH:   0x002B,
-		sdl.SCANCODE_Z:           0x002C,
-		sdl.SCANCODE_X:           0x002D,
-		sdl.SCANCODE_C:           0x002E,
-		sdl.SCANCODE_V:           0x002F,
-		sdl.SCANCODE_B:           0x0030,
-		sdl.SCANCODE_N:           0x0031,
-		sdl.SCANCODE_M:           0x0032,
-		sdl.SCANCODE_COMMA:       0x0033,
-		sdl.SCANCODE_PERIOD:      0x0034,
-		sdl.SCANCODE_SLASH:       0x0035,
-		sdl.SCANCODE_RSHIFT:      0x0036,
-		sdl.SCANCODE_KP_MULTIPLY: 0x0037,
-		sdl.SCANCODE_LALT:        0x0038,
-		sdl.SCANCODE_SPACE:       0x0039,
-		sdl.SCANCODE_CAPSLOCK:    0x003A,
-		sdl.SCANCODE_F1:          0x003B,
-		sdl.SCANCODE_F2:          0x003C,
-		sdl.SCANCODE_F3:          0x003D,
-		sdl.SCANCODE_F4:          0x003E,
-		sdl.SCANCODE_F5:          0x003F,
-		sdl.SCANCODE_F6:          0x0040,
-		sdl.SCANCODE_F7:          0x0041,
-		sdl.SCANCODE_F8:          0x0042,
-		sdl.SCANCODE_F9:          0x0043,
-		sdl.SCANCODE_F10:         0x0044,
+		sdl.SCANCODE_APOSTROPHE:   0x0028,
+		sdl.SCANCODE_GRAVE:        0x0029,
+		sdl.SCANCODE_LSHIFT:       0x002A,
+		sdl.SCANCODE_BACKSLASH:    0x002B,
+		sdl.SCANCODE_Z:            0x002C,
+		sdl.SCANCODE_X:            0x002D,
+		sdl.SCANCODE_C:            0x002E,
+		sdl.SCANCODE_V:            0x002F,
+		sdl.SCANCODE_B:            0x0030,
+		sdl.SCANCODE_N:            0x0031,
+		sdl.SCANCODE_M:            0x0032,
+		sdl.SCANCODE_COMMA:        0x0033,
+		sdl.SCANCODE_PERIOD:       0x0034,
+		sdl.SCANCODE_SLASH:        0x0035,
+		sdl.SCANCODE_RSHIFT:       0x0036,
+		sdl.SCANCODE_KP_MULTIPLY:  0x0037,
+		sdl.SCANCODE_LALT:         0x0038,
+		sdl.SCANCODE_SPACE:        0x0039,
+		sdl.SCANCODE_CAPSLOCK:     0x003A,
+		sdl.SCANCODE_F1:           0x003B,
+		sdl.SCANCODE_F2:           0x003C,
+		sdl.SCANCODE_F3:           0x003D,
+		sdl.SCANCODE_F4:           0x003E,
+		sdl.SCANCODE_F5:           0x003F,
+		sdl.SCANCODE_F6:           0x0040,
+		sdl.SCANCODE_F7:           0x0041,
+		sdl.SCANCODE_F8:           0x0042,
+		sdl.SCANCODE_F9:           0x0043,
+		sdl.SCANCODE_F10:          0x0044,
 		// sdl.SCANCODE_PAUSE:        0x0045,
 		sdl.SCANCODE_SCROLLLOCK:   0x0046,
 		sdl.SCANCODE_KP_7:         0x0047,
