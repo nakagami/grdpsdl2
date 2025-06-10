@@ -81,16 +81,24 @@ func mainLoop(hostPort, domain, user, password string, width, height int) (err e
 			showCursor = true
 		}
 		sdl.SetCursor(cursorCache[idx])
-	}).OnPointerUpdate(func(idx uint16, x uint16, y uint16, width uint16, height uint16, mask []byte, data []byte) {
+	}).OnPointerUpdate(func(idx uint16, bpp uint16, x uint16, y uint16, width uint16, height uint16, mask []byte, data []byte) {
 		if !showCursor {
 			sdl.ShowCursor(sdl.ENABLE)
 			showCursor = true
 		}
+		if bpp != 32 {
+			slog.Error("Can't update Pointer", "bpp", bpp)
+			return
+		}
 
 		// I don't know why, but there is a strange bitmap on the bottom line.
 		height -= 1
-		surface, _ := sdl.CreateRGBSurfaceWithFormatFrom(
+
+		surface, err := sdl.CreateRGBSurfaceWithFormatFrom(
 			unsafe.Pointer(&data[0]), int32(width), int32(height), 32, int32(width*4), uint32(sdl.PIXELFORMAT_RGBA32))
+		if err != nil {
+			slog.Error("surface", "err", err, "bpp", bpp, "width", width, "height", height, "len(data)", len(data))
+		}
 
 		// swap lines
 		line_len := int(width) * 4
