@@ -38,6 +38,9 @@ func paintImage(img *image.RGBA, surface *sdl.Surface, destX, destY int) {
 }
 
 func mainLoop(hostPort, domain, user, password string, width, height int) (err error) {
+	cursorCache := make(map[uint16]*sdl.Cursor)
+	showCursor := true
+
 	if err = sdl.Init(sdl.INIT_VIDEO); err != nil {
 		return err
 	}
@@ -69,6 +72,45 @@ func mainLoop(hostPort, domain, user, password string, width, height int) (err e
 			paintImage(bm.RGBA(), surface, bm.DestLeft, bm.DestTop)
 		}
 		window.UpdateSurface()
+	}).OnPointerHide(func() {
+		sdl.ShowCursor(sdl.DISABLE)
+		showCursor = false
+	}).OnPointerCached(func(idx uint16) {
+		if !showCursor {
+			sdl.ShowCursor(sdl.ENABLE)
+			showCursor = true
+		}
+		sdl.SetCursor(cursorCache[idx])
+	}).OnPointerUpdate(func(idx uint16, x uint16, y uint16, width uint16, height uint16, mask []byte, data []byte) {
+		if !showCursor {
+			sdl.ShowCursor(sdl.ENABLE)
+			showCursor = true
+		}
+
+		// I don't know why, but there is a strange bitmap on the bottom line.
+		height -= 1
+		surface, _ := sdl.CreateRGBSurfaceWithFormatFrom(
+			unsafe.Pointer(&data[0]), int32(width), int32(height), 32, int32(width*4), uint32(sdl.PIXELFORMAT_RGBA32))
+
+		// swap lines
+		line_len := int(width) * 4
+		upper_line := 0
+		lower_line := int(height) - 1
+		for upper_line < int(height)/2 {
+			for i := 0; i < line_len; i++ {
+				data[upper_line*line_len+i], data[lower_line*line_len+i] = data[lower_line*line_len+i], data[upper_line*line_len+i]
+			}
+			upper_line += 1
+			lower_line -= 1
+		}
+
+		cursor := sdl.CreateColorCursor(surface, int32(x), int32(y))
+		cursorCache[idx] = cursor
+		if cursor == nil {
+			slog.Error("Failed to create cursor")
+		}
+		sdl.SetCursor(cursor)
+
 	})
 
 	quit := false
