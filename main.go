@@ -99,6 +99,7 @@ func mainLoop(hostPort, domain, user, password string, width, height int) (err e
 		if err != nil {
 			slog.Error("surface", "err", err, "bpp", bpp, "width", width, "height", height, "len(data)", len(data))
 		}
+		defer surface.Free()
 
 		// swap lines
 		line_len := int(width) * 4
