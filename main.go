@@ -1,7 +1,6 @@
 package main
 
 import (
-	"image"
 	"log/slog"
 	"os"
 	"strings"
@@ -11,28 +10,33 @@ import (
 	"github.com/veandco/go-sdl2/sdl"
 )
 
-func paintImage(img *image.RGBA, surface *sdl.Surface, destX, destY int) {
-	w, h := img.Bounds().Dx(), img.Bounds().Dy()
-	surfW, surfH := int(surface.W), int(surface.H)
+func paintImages(bs []grdp.Bitmap, surface *sdl.Surface) {
+	for _, bm := range bs {
+		img := bm.RGBA()
+		destX := bm.DestLeft
+		destY := bm.DestTop
+		w, h := img.Bounds().Dx(), img.Bounds().Dy()
+		surfW, surfH := int(surface.W), int(surface.H)
 
-	for y := 0; y < h; y++ {
-		for x := 0; x < w; x++ {
-			sx, sy := destX+x, destY+y
-			if sx < 0 || sy < 0 || sx >= surfW || sy >= surfH {
-				continue
+		for y := 0; y < h; y++ {
+			for x := 0; x < w; x++ {
+				sx, sy := destX+x, destY+y
+				if sx < 0 || sy < 0 || sx >= surfW || sy >= surfH {
+					continue
+				}
+				offset := img.PixOffset(x, y)
+				r := img.Pix[offset+0]
+				g := img.Pix[offset+1]
+				b := img.Pix[offset+2]
+				a := img.Pix[offset+3]
+				color := sdl.MapRGBA(surface.Format, r, g, b, a)
+
+				pixels := surface.Pixels()
+				ptr := uintptr(unsafe.Pointer(&pixels[0]))
+				pitch := int(surface.Pitch)
+				pxOffset := sy*pitch + sx*4 // RGBA32bit
+				*(*uint32)(unsafe.Pointer(ptr + uintptr(pxOffset))) = color
 			}
-			offset := img.PixOffset(x, y)
-			r := img.Pix[offset+0]
-			g := img.Pix[offset+1]
-			b := img.Pix[offset+2]
-			a := img.Pix[offset+3]
-			color := sdl.MapRGBA(surface.Format, r, g, b, a)
-
-			pixels := surface.Pixels()
-			ptr := uintptr(unsafe.Pointer(&pixels[0]))
-			pitch := int(surface.Pitch)
-			pxOffset := sy*pitch + sx*4 // RGBA32bit
-			*(*uint32)(unsafe.Pointer(ptr + uintptr(pxOffset))) = color
 		}
 	}
 }
@@ -66,11 +70,7 @@ func mainLoop(hostPort, domain, user, password string, width, height int) (err e
 	}).OnReady(func() {
 		slog.Info("on ready")
 	}).OnBitmap(func(bs []grdp.Bitmap) {
-		surface.Lock()
-		defer surface.Unlock()
-		for _, bm := range bs {
-			paintImage(bm.RGBA(), surface, bm.DestLeft, bm.DestTop)
-		}
+		paintImages(bs, surface)
 		window.UpdateSurface()
 	}).OnPointerHide(func() {
 		sdl.ShowCursor(sdl.DISABLE)
