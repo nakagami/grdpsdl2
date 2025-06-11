@@ -17,4 +17,5 @@ export GRDP_PORT=3389
 export GRDP_HOST=host
 export GRDP_WINDOW_SIZE=1280x800
 ```
-In your environment. You may also need to set `GRDP_DOMAIN`
+Your account may need to specify a domain.
+If so, please also set `GRDP_DOMAIN`.
