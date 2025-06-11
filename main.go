@@ -120,16 +120,13 @@ func mainLoop(hostPort, domain, user, password string, width, height int) (err e
 			cursor = sdl.CreateColorCursor(surface, int32(x), int32(y))
 
 		} else if bpp == 24 {
-			surface, err := sdl.CreateRGBSurfaceFrom(
+			surface, err := sdl.CreateRGBSurfaceWithFormatFrom(
 				unsafe.Pointer(&data[0]),
 				int32(width),
 				int32(height),
 				24,
-				int(width*3),
-				0x0000FF,
-				0x00FF00,
-				0xFF0000,
-				0,
+				int32(width*3),
+				uint32(sdl.PIXELFORMAT_RGB888),
 			)
 			if err != nil {
 				slog.Error("surface", "err", err, "bpp", bpp, "width", width, "height", height, "len(data)", len(data))
