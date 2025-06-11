@@ -11,12 +11,14 @@ import (
 )
 
 func paintImages(bs []grdp.Bitmap, surface *sdl.Surface) {
+	surfW, surfH := int(surface.W), int(surface.H)
+	pixels := surface.Pixels()
+
 	for _, bm := range bs {
 		img := bm.RGBA()
 		destX := bm.DestLeft
 		destY := bm.DestTop
 		w, h := img.Bounds().Dx(), img.Bounds().Dy()
-		surfW, surfH := int(surface.W), int(surface.H)
 
 		for y := 0; y < h; y++ {
 			for x := 0; x < w; x++ {
@@ -30,8 +32,6 @@ func paintImages(bs []grdp.Bitmap, surface *sdl.Surface) {
 				b := img.Pix[offset+2]
 				a := img.Pix[offset+3]
 				color := sdl.MapRGBA(surface.Format, r, g, b, a)
-
-				pixels := surface.Pixels()
 				ptr := uintptr(unsafe.Pointer(&pixels[0]))
 				pitch := int(surface.Pitch)
 				pxOffset := sy*pitch + sx*4 // RGBA32bit
