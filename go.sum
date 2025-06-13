@@ -1,7 +1,7 @@
 github.com/lunixbochs/struc v0.0.0-20200707160740-784aaebc1d40 h1:EnfXoSqDfSNJv0VBNqY/88RNnhSGYkrHaO0mmFGbVsc=
 github.com/lunixbochs/struc v0.0.0-20200707160740-784aaebc1d40/go.mod h1:vy1vK6wD6j7xX6O6hXe621WabdtNkou2h7uRtTfRMyg=
-github.com/nakagami/grdp v0.3.4 h1:BoPXj7gSdhNmK/ZeaYrIQuhYxNvBS86/7E2VRvNf9FA=
-github.com/nakagami/grdp v0.3.4/go.mod h1:QC6seo8SkXi+vhVhQG4P49bY6s/gRVYAd0OIxZMYOEI=
+github.com/nakagami/grdp v0.3.5 h1:IlyVbAELr6hPYj112OjMGRY57NfNt25udgAzuI2AHVU=
+github.com/nakagami/grdp v0.3.5/go.mod h1:QC6seo8SkXi+vhVhQG4P49bY6s/gRVYAd0OIxZMYOEI=
 github.com/veandco/go-sdl2 v0.4.40 h1:fZv6wC3zz1Xt167P09gazawnpa0KY5LM7JAvKpX9d/U=
 github.com/veandco/go-sdl2 v0.4.40/go.mod h1:OROqMhHD43nT4/i9crJukyVecjPNYYuCofep6SNiAjY=
 golang.org/x/crypto v0.0.0-20220622213112-05595931fe9d h1:sK3txAijHtOK88l68nt020reeT1ZdKLIYetKl95FzVY=
