@@ -86,59 +86,46 @@ func mainLoop(hostPort, domain, user, password string, width, height int) (err e
 			sdl.ShowCursor(sdl.ENABLE)
 			showCursor = true
 		}
-
-		var cursor *sdl.Cursor
-
-		if bpp == 32 {
-			// I don't know why, but there is a strange bitmap on the bottom line.
-			height -= 1
-
-			surface, err := sdl.CreateRGBSurfaceWithFormatFrom(
-				unsafe.Pointer(&data[0]),
-				int32(width),
-				int32(height),
-				32,
-				int32(width*4),
-				uint32(sdl.PIXELFORMAT_RGBA32),
-			)
-			if err != nil {
-				slog.Error("surface", "err", err, "bpp", bpp, "width", width, "height", height, "len(data)", len(data))
-			}
-			defer surface.Free()
-
-			// swap lines
-			line_len := int(width) * 4
-			upper_line := 0
-			lower_line := int(height) - 1
-			for upper_line < int(height)/2 {
-				for i := 0; i < line_len; i++ {
-					data[upper_line*line_len+i], data[lower_line*line_len+i] = data[lower_line*line_len+i], data[upper_line*line_len+i]
+		if bpp == 24 {
+			n := len(data) / 3
+			rgba := make([]byte, n*4)
+			for i := 0; i < n; i++ {
+				rgba[4*i+0] = data[3*i+0]
+				rgba[4*i+1] = data[3*i+1]
+				rgba[4*i+2] = data[3*i+2]
+				if data[3*i+0] == 0 && data[3*i+1] == 0 && data[3*i+2] == 0 {
+					rgba[4*i+3] = 0
+				} else {
+					rgba[4*i+3] = 255
 				}
-				upper_line += 1
-				lower_line -= 1
 			}
-			cursor = sdl.CreateColorCursor(surface, int32(x), int32(y))
-
-		} else if bpp == 24 {
-			surface, err := sdl.CreateRGBSurfaceFrom(
-				unsafe.Pointer(&data[0]),
-				int32(width),
-				int32(height),
-				24,
-				int(width*3),
-				0x0000FF,
-				0x00FF00,
-				0xFF0000,
-				0,
-			)
-			if err != nil {
-				slog.Error("surface", "err", err, "bpp", bpp, "width", width, "height", height, "len(data)", len(data))
-			}
-			defer surface.Free()
-			cursor = sdl.CreateColorCursor(surface, int32(x), int32(y))
-		} else {
-			slog.Error("pointer update", "bpp", bpp)
+			data = rgba
 		}
+		surface, err := sdl.CreateRGBSurfaceWithFormatFrom(
+			unsafe.Pointer(&data[0]),
+			int32(width),
+			int32(height),
+			32,
+			int32(width*4),
+			uint32(sdl.PIXELFORMAT_RGBA32),
+		)
+		if err != nil {
+			slog.Error("surface", "err", err)
+		}
+		defer surface.Free()
+
+		// swap lines
+		line_len := int(width) * 4
+		upper_line := 0
+		lower_line := int(height) - 1
+		for upper_line < int(height)/2 {
+			for i := 0; i < line_len; i++ {
+				data[upper_line*line_len+i], data[lower_line*line_len+i] = data[lower_line*line_len+i], data[upper_line*line_len+i]
+			}
+			upper_line += 1
+			lower_line -= 1
+		}
+		cursor := sdl.CreateColorCursor(surface, int32(x), int32(y))
 
 		if cursor != nil {
 			cursorCache[idx] = cursor
