@@ -174,6 +174,13 @@ func mainLoop(hostPort, domain, user, password string, width, height int) (err e
 }
 
 func transKey(scancode sdl.Scancode) []int {
+	// meta -> shift + control
+	if scancode == sdl.SCANCODE_LGUI {
+		return []int{0x002A, 0x001D}
+	}
+	if scancode == sdl.SCANCODE_RGUI {
+		return []int{0x0036, 0xE01D}
+	}
 	var ScancodeMap = map[sdl.Scancode]int{
 		sdl.SCANCODE_UNKNOWN:      0x0000,
 		sdl.SCANCODE_ESCAPE:       0x0001,
