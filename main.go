@@ -143,10 +143,12 @@ func mainLoop(hostPort, domain, user, password string, width, height int) (err e
 				quit = true
 
 			case *sdl.KeyboardEvent:
-				if t.State == sdl.RELEASED {
-					rdpClient.KeyUp(transKey(t.Keysym.Scancode))
-				} else if t.State == sdl.PRESSED {
-					rdpClient.KeyDown(transKey(t.Keysym.Scancode))
+				for _, k := range transKey(t.Keysym.Scancode) {
+					if t.State == sdl.RELEASED {
+						rdpClient.KeyUp(k)
+					} else if t.State == sdl.PRESSED {
+						rdpClient.KeyDown(k)
+					}
 				}
 
 			case *sdl.MouseMotionEvent:
@@ -171,8 +173,7 @@ func mainLoop(hostPort, domain, user, password string, width, height int) (err e
 	return err
 }
 
-func transKey(scancode sdl.Scancode) int {
-
+func transKey(scancode sdl.Scancode) []int {
 	var ScancodeMap = map[sdl.Scancode]int{
 		sdl.SCANCODE_UNKNOWN:      0x0000,
 		sdl.SCANCODE_ESCAPE:       0x0001,
@@ -281,9 +282,9 @@ func transKey(scancode sdl.Scancode) int {
 		sdl.SCANCODE_MENU:         0xE05D,
 	}
 	if v, ok := ScancodeMap[scancode]; ok {
-		return v
+		return []int{v}
 	}
-	return 0
+	return []int{0}
 }
 
 func main() {
