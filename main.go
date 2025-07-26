@@ -301,8 +301,8 @@ func main() {
 	domain := os.Getenv("GRDP_DOMAIN")
 	user := os.Getenv("GRDP_USER")
 	password := os.Getenv("GRDP_PASSWORD")
-	width := 1280
-	height := 800
+	width := 1920
+	height := 1080
 
 	mainLoop(hostPort, domain, user, password, width, height)
 }
