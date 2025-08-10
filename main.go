@@ -32,10 +32,9 @@ func paintImages(bs []grdp.Bitmap, surface *sdl.Surface) {
 				b := img.Pix[offset+2]
 				a := img.Pix[offset+3]
 				color := sdl.MapRGBA(surface.Format, r, g, b, a)
-				ptr := uintptr(unsafe.Pointer(&pixels[0]))
 				pitch := int(surface.Pitch)
 				pxOffset := sy*pitch + sx*4 // RGBA32bit
-				*(*uint32)(unsafe.Pointer(ptr + uintptr(pxOffset))) = color
+				*(*uint32)(unsafe.Pointer(&pixels[pxOffset])) = color
 			}
 		}
 	}
