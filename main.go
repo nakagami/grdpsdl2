@@ -1,6 +1,8 @@
 package main
 
 import (
+	"flag"
+	"fmt"
 	"log/slog"
 	"os"
 	"strings"
@@ -40,7 +42,7 @@ func paintImages(bs []grdp.Bitmap, surface *sdl.Surface) {
 	}
 }
 
-func mainLoop(hostPort, domain, user, password string, width, height int) (err error) {
+func mainLoop(hostPort, domain, user, password string, width, height int, swap_alt_meta bool) (err error) {
 	cursorCache := make(map[uint16]*sdl.Cursor)
 	showCursor := true
 
@@ -142,7 +144,7 @@ func mainLoop(hostPort, domain, user, password string, width, height int) (err e
 				quit = true
 
 			case *sdl.KeyboardEvent:
-				for _, k := range transKey(t.Keysym.Scancode) {
+				for _, k := range transKey(t.Keysym.Scancode, swap_alt_meta) {
 					if t.State == sdl.RELEASED {
 						rdpClient.KeyUp(k)
 					} else if t.State == sdl.PRESSED {
@@ -172,14 +174,15 @@ func mainLoop(hostPort, domain, user, password string, width, height int) (err e
 	return err
 }
 
-func transKey(scancode sdl.Scancode) []int {
-	// meta -> shift + control
-	if scancode == sdl.SCANCODE_LGUI {
-		return []int{0x002A, 0x001D}
+func transKey(scancode sdl.Scancode, trans_alt_meta bool) []int {
+	if trans_alt_meta {
+		if scancode == 0xE2 || scancode == 0xe6 {
+			scancode += 1
+		} else if scancode == 0xe3 || scancode == 0xE7 {
+			scancode -= 1
+		}
 	}
-	if scancode == sdl.SCANCODE_RGUI {
-		return []int{0x0036, 0xE01D}
-	}
+
 	var ScancodeMap = map[sdl.Scancode]int{
 		sdl.SCANCODE_UNKNOWN:      0x0000,
 		sdl.SCANCODE_ESCAPE:       0x0001,
@@ -296,12 +299,20 @@ func transKey(scancode sdl.Scancode) []int {
 func main() {
 	//    handler := slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelDebug})
 	//    slog.SetDefault(slog.New(handler))
+
+	swap_alt_meta := flag.Bool("swap-alt-meta", false, "swap alt and meta key")
+	flag.Parse()
+	slog.Info("flag", "swap_alt_meta", *swap_alt_meta)
+
 	hostPort := strings.Join([]string{os.Getenv("GRDP_HOST"), os.Getenv("GRDP_PORT")}, ":")
 	domain := os.Getenv("GRDP_DOMAIN")
 	user := os.Getenv("GRDP_USER")
 	password := os.Getenv("GRDP_PASSWORD")
-	width := 1920
-	height := 1080
+	var width, height int
+	_, err := fmt.Sscanf(os.Getenv("GRDP_WINDOW_SIZE"), "%dx%d", &width, &height)
+	if err != nil {
+		width, height = 1280, 800
+	}
 
-	mainLoop(hostPort, domain, user, password, width, height)
+	mainLoop(hostPort, domain, user, password, width, height, *swap_alt_meta)
 }
