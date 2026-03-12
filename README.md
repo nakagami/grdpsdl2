@@ -2,6 +2,12 @@
 
 Microsoft RDP client built with [grdp](https://github.com/nakagami/grdp) and [go-sdl2](https://github.com/veandco/go-sdl2).
 
+## Installation
+
+```sh
+go install github.com/nakagami/grdpsdl2@latest
+```
+
 ## Requirements
 
 Install SDL2 by following the instructions [here](https://github.com/veandco/go-sdl2?tab=readme-ov-file#requirements).
