@@ -13,38 +13,22 @@ import (
 )
 
 func paintImages(bs []grdp.Bitmap, surface *sdl.Surface) {
-	surfW, surfH := int(surface.W), int(surface.H)
-	pixels := surface.Pixels()
-	pitch := int(surface.Pitch)
-
 	for _, bm := range bs {
 		img := bm.RGBA()
-		destX := bm.DestLeft
-		destY := bm.DestTop
 		w, h := img.Bounds().Dx(), img.Bounds().Dy()
-		stride := img.Stride
 
-		for y := 0; y < h; y++ {
-			sy := destY + y
-			if sy < 0 || sy >= surfH {
-				continue
-			}
-			imgRow := y * stride
-			dstRow := sy * pitch
-			for x := 0; x < w; x++ {
-				sx := destX + x
-				if sx < 0 || sx >= surfW {
-					continue
-				}
-				offset := imgRow + x*4
-				r := img.Pix[offset+0]
-				g := img.Pix[offset+1]
-				b := img.Pix[offset+2]
-				a := img.Pix[offset+3]
-				color := sdl.MapRGBA(surface.Format, r, g, b, a)
-				*(*uint32)(unsafe.Pointer(&pixels[dstRow+sx*4])) = color
-			}
+		src, err := sdl.CreateRGBSurfaceWithFormatFrom(
+			unsafe.Pointer(&img.Pix[0]),
+			int32(w), int32(h),
+			32, int32(img.Stride),
+			uint32(sdl.PIXELFORMAT_RGBA32),
+		)
+		if err != nil {
+			continue
 		}
+		dstRect := sdl.Rect{X: int32(bm.DestLeft), Y: int32(bm.DestTop), W: int32(w), H: int32(h)}
+		src.Blit(nil, surface, &dstRect)
+		src.Free()
 	}
 }
 
@@ -125,12 +109,15 @@ func mainLoop(hostPort, domain, user, password string, width, height int, swap_a
 		line_len := int(width) * 4
 		upper_line := 0
 		lower_line := int(height) - 1
+		tmp := make([]byte, line_len)
 		for upper_line < int(height)/2 {
-			for i := 0; i < line_len; i++ {
-				data[upper_line*line_len+i], data[lower_line*line_len+i] = data[lower_line*line_len+i], data[upper_line*line_len+i]
-			}
-			upper_line += 1
-			lower_line -= 1
+			upper := data[upper_line*line_len : upper_line*line_len+line_len]
+			lower := data[lower_line*line_len : lower_line*line_len+line_len]
+			copy(tmp, upper)
+			copy(upper, lower)
+			copy(lower, tmp)
+			upper_line++
+			lower_line--
 		}
 		cursor := sdl.CreateColorCursor(surface, int32(x), int32(y))
 
@@ -144,7 +131,8 @@ func mainLoop(hostPort, domain, user, password string, width, height int, swap_a
 
 	quit := false
 	for !quit {
-		for event := sdl.PollEvent(); event != nil; event = sdl.PollEvent() {
+		event := sdl.WaitEventTimeout(8)
+		for ; event != nil; event = sdl.PollEvent() {
 			switch t := event.(type) {
 			case *sdl.QuitEvent:
 				quit = true
@@ -173,7 +161,6 @@ func mainLoop(hostPort, domain, user, password string, width, height int, swap_a
 				}
 			}
 		}
-		sdl.Delay(1)
 	}
 
 	err = window.Destroy()
