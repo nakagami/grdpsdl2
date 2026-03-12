@@ -15,28 +15,34 @@ import (
 func paintImages(bs []grdp.Bitmap, surface *sdl.Surface) {
 	surfW, surfH := int(surface.W), int(surface.H)
 	pixels := surface.Pixels()
+	pitch := int(surface.Pitch)
 
 	for _, bm := range bs {
 		img := bm.RGBA()
 		destX := bm.DestLeft
 		destY := bm.DestTop
 		w, h := img.Bounds().Dx(), img.Bounds().Dy()
+		stride := img.Stride
 
 		for y := 0; y < h; y++ {
+			sy := destY + y
+			if sy < 0 || sy >= surfH {
+				continue
+			}
+			imgRow := y * stride
+			dstRow := sy * pitch
 			for x := 0; x < w; x++ {
-				sx, sy := destX+x, destY+y
-				if sx < 0 || sy < 0 || sx >= surfW || sy >= surfH {
+				sx := destX + x
+				if sx < 0 || sx >= surfW {
 					continue
 				}
-				offset := img.PixOffset(x, y)
+				offset := imgRow + x*4
 				r := img.Pix[offset+0]
 				g := img.Pix[offset+1]
 				b := img.Pix[offset+2]
 				a := img.Pix[offset+3]
 				color := sdl.MapRGBA(surface.Format, r, g, b, a)
-				pitch := int(surface.Pitch)
-				pxOffset := sy*pitch + sx*4 // RGBA32bit
-				*(*uint32)(unsafe.Pointer(&pixels[pxOffset])) = color
+				*(*uint32)(unsafe.Pointer(&pixels[dstRow+sx*4])) = color
 			}
 		}
 	}
