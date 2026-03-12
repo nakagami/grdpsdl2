@@ -150,12 +150,11 @@ func mainLoop(hostPort, domain, user, password string, width, height int, swap_a
 				quit = true
 
 			case *sdl.KeyboardEvent:
-				for _, k := range transKey(t.Keysym.Scancode, swap_alt_meta) {
-					if t.State == sdl.RELEASED {
-						rdpClient.KeyUp(k)
-					} else if t.State == sdl.PRESSED {
-						rdpClient.KeyDown(k)
-					}
+				k := transKey(t.Keysym.Scancode, swap_alt_meta)
+				if t.State == sdl.RELEASED {
+					rdpClient.KeyUp(k)
+				} else if t.State == sdl.PRESSED {
+					rdpClient.KeyDown(k)
 				}
 
 			case *sdl.MouseMotionEvent:
@@ -174,13 +173,14 @@ func mainLoop(hostPort, domain, user, password string, width, height int, swap_a
 				}
 			}
 		}
+		sdl.Delay(1)
 	}
 
 	err = window.Destroy()
 	return err
 }
 
-func transKey(scancode sdl.Scancode, trans_alt_meta bool) []int {
+func transKey(scancode sdl.Scancode, trans_alt_meta bool) int {
 	if trans_alt_meta {
 		if scancode == 0xE2 || scancode == 0xe6 {
 			scancode += 1
@@ -189,7 +189,13 @@ func transKey(scancode sdl.Scancode, trans_alt_meta bool) []int {
 		}
 	}
 
-	var ScancodeMap = map[sdl.Scancode]int{
+	if v, ok := scancodeMap[scancode]; ok {
+		return v
+	}
+	return 0
+}
+
+var scancodeMap = map[sdl.Scancode]int{
 		sdl.SCANCODE_UNKNOWN:      0x0000,
 		sdl.SCANCODE_ESCAPE:       0x0001,
 		sdl.SCANCODE_1:            0x0002,
@@ -295,12 +301,8 @@ func transKey(scancode sdl.Scancode, trans_alt_meta bool) []int {
 		sdl.SCANCODE_INSERT:       0xE052,
 		sdl.SCANCODE_DELETE:       0xE053,
 		sdl.SCANCODE_MENU:         0xE05D,
-	}
-	if v, ok := ScancodeMap[scancode]; ok {
-		return []int{v}
-	}
-	return []int{0}
 }
+
 
 func main() {
 	//    handler := slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelDebug})
