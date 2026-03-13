@@ -32,7 +32,7 @@ func paintImages(bs []grdp.Bitmap, surface *sdl.Surface) {
 	}
 }
 
-func mainLoop(hostPort, domain, user, password string, width, height int, swap_alt_meta bool) (err error) {
+func mainLoop(hostPort, domain, user, password string, width, height int, swap_alt_meta bool, keyboardType, keyboardLayout string) (err error) {
 	cursorCache := make(map[uint16]*sdl.Cursor)
 	showCursor := true
 
@@ -51,6 +51,12 @@ func mainLoop(hostPort, domain, user, password string, width, height int, swap_a
 	surface, _ := window.GetSurface()
 
 	rdpClient := grdp.NewRdpClient(hostPort, width, height)
+	if keyboardType != "" {
+		rdpClient.SetKeyboardType(keyboardType)
+	}
+	if keyboardLayout != "" {
+		rdpClient.SetKeyboardLayout(keyboardLayout)
+	}
 	err = rdpClient.Login(domain, user, password)
 	if err != nil {
 		return err
@@ -303,11 +309,13 @@ func main() {
 	domain := os.Getenv("GRDP_DOMAIN")
 	user := os.Getenv("GRDP_USER")
 	password := os.Getenv("GRDP_PASSWORD")
+	keyboardType := os.Getenv("GRDP_KEYBOARD_TYPE")
+	keyboardLayout := os.Getenv("GRDP_KEYBOARD_LAYOUT")
 	var width, height int
 	_, err := fmt.Sscanf(os.Getenv("GRDP_WINDOW_SIZE"), "%dx%d", &width, &height)
 	if err != nil {
 		width, height = 1280, 800
 	}
 
-	mainLoop(hostPort, domain, user, password, width, height, *swap_alt_meta)
+	mainLoop(hostPort, domain, user, password, width, height, *swap_alt_meta, keyboardType, keyboardLayout)
 }

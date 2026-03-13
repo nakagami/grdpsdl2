@@ -16,14 +16,16 @@ Install SDL2 by following the instructions [here](https://github.com/veandco/go-
 
 Connection parameters are specified via environment variables.
 
-| Variable           | Description                          | Default    |
-|--------------------|--------------------------------------|------------|
-| `GRDP_HOST`        | RDP server hostname or IP address    | (required) |
-| `GRDP_PORT`        | RDP server port                      | (required) |
-| `GRDP_USER`        | Username                             | (required) |
-| `GRDP_PASSWORD`    | Password                             | (required) |
-| `GRDP_DOMAIN`      | Domain (if required by your account) | (empty)    |
-| `GRDP_WINDOW_SIZE` | Window size in `WxH` format          | `1280x800` |
+| Variable               | Description                          | Default    |
+|------------------------|--------------------------------------|------------|
+| `GRDP_HOST`            | RDP server hostname or IP address    | (required) |
+| `GRDP_PORT`            | RDP server port                      | (required) |
+| `GRDP_USER`            | Username                             | (required) |
+| `GRDP_PASSWORD`        | Password                             | (required) |
+| `GRDP_DOMAIN`          | Domain (if required by your account) | (empty)    |
+| `GRDP_WINDOW_SIZE`     | Window size in `WxH` format          | `1280x800` |
+| `GRDP_KEYBOARD_TYPE`   | Keyboard type (see below)            | `IBM_101_102_KEYS` |
+| `GRDP_KEYBOARD_LAYOUT` | Keyboard layout (see below)          | `US`       |
 
 Example:
 
@@ -33,7 +35,45 @@ export GRDP_PORT=3389
 export GRDP_USER=user
 export GRDP_PASSWORD=password
 export GRDP_WINDOW_SIZE=1280x800
+export GRDP_KEYBOARD_TYPE=IBM_101_102_KEYS
+export GRDP_KEYBOARD_LAYOUT=JAPANESE
 ```
+
+### Keyboard Types (`GRDP_KEYBOARD_TYPE`)
+
+| Value              | Description              |
+|--------------------|--------------------------|
+| `IBM_PC_XT_83_KEY` | IBM PC/XT 83-key         |
+| `OLIVETTI`         | Olivetti                 |
+| `IBM_PC_AT_84_KEY` | IBM PC/AT 84-key         |
+| `IBM_101_102_KEYS` | IBM 101/102-key (default)|
+| `NOKIA_1050`       | Nokia 1050               |
+| `NOKIA_9140`       | Nokia 9140               |
+| `JAPANESE`         | Japanese                 |
+
+### Keyboard Layouts (`GRDP_KEYBOARD_LAYOUT`)
+
+| Value                 | Description              |
+|-----------------------|--------------------------|
+| `ARABIC`              | Arabic                   |
+| `BULGARIAN`           | Bulgarian                |
+| `CHINESE_US_KEYBOARD` | Chinese (US keyboard)    |
+| `CZECH`               | Czech                    |
+| `DANISH`              | Danish                   |
+| `GERMAN`              | German                   |
+| `GREEK`               | Greek                    |
+| `US`                  | US English (default)     |
+| `SPANISH`             | Spanish                  |
+| `FINNISH`             | Finnish                  |
+| `FRENCH`              | French                   |
+| `HEBREW`              | Hebrew                   |
+| `HUNGARIAN`           | Hungarian                |
+| `ICELANDIC`           | Icelandic                |
+| `ITALIAN`             | Italian                  |
+| `JAPANESE`            | Japanese                 |
+| `KOREAN`              | Korean                   |
+| `DUTCH`               | Dutch                    |
+| `NORWEGIAN`           | Norwegian                |
 
 ## Usage
 
