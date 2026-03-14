@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"os"
 	"strings"
+	"time"
 	"unsafe"
 
 	"github.com/nakagami/grdp"
@@ -44,7 +45,7 @@ func mainLoop(hostPort, domain, user, password string, width, height int, swap_a
 	sdl.StopTextInput()
 
 	window, err := sdl.CreateWindow("GRDPSDL2", sdl.WINDOWPOS_UNDEFINED,
-		sdl.WINDOWPOS_UNDEFINED, int32(width), int32(height), sdl.WINDOW_SHOWN)
+		sdl.WINDOWPOS_UNDEFINED, int32(width), int32(height), sdl.WINDOW_SHOWN|sdl.WINDOW_RESIZABLE)
 	if err != nil {
 		return err
 	}
@@ -136,12 +137,24 @@ func mainLoop(hostPort, domain, user, password string, width, height int, swap_a
 	})
 
 	quit := false
+	var resizePending bool
+	var resizeTime time.Time
+	var resizeW, resizeH int32
+
 	for !quit {
 		event := sdl.WaitEventTimeout(8)
 		for ; event != nil; event = sdl.PollEvent() {
 			switch t := event.(type) {
 			case *sdl.QuitEvent:
 				quit = true
+
+			case *sdl.WindowEvent:
+				if t.Event == sdl.WINDOWEVENT_RESIZED {
+					resizeW = t.Data1
+					resizeH = t.Data2
+					resizePending = true
+					resizeTime = time.Now()
+				}
 
 			case *sdl.KeyboardEvent:
 				k := transKey(t.Keysym.Scancode, swap_alt_meta)
@@ -165,6 +178,16 @@ func mainLoop(hostPort, domain, user, password string, width, height int, swap_a
 				if t.X == 0 {
 					rdpClient.MouseWheel(int(t.Y) * 10)
 				}
+			}
+		}
+
+		if resizePending && time.Since(resizeTime) > 500*time.Millisecond {
+			resizePending = false
+			slog.Info("Window resized, reconnecting", "width", resizeW, "height", resizeH)
+			if err := rdpClient.Reconnect(int(resizeW), int(resizeH)); err != nil {
+				slog.Error("Reconnect failed", "err", err)
+			} else {
+				surface, _ = window.GetSurface()
 			}
 		}
 	}
