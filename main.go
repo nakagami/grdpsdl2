@@ -15,23 +15,12 @@ import (
 	"github.com/veandco/go-sdl2/sdl"
 )
 
-func paintImages(bs []grdp.Bitmap, surface *sdl.Surface) {
+func paintImages(bs []grdp.Bitmap, texture *sdl.Texture) {
 	for _, bm := range bs {
 		img := bm.RGBA()
 		w, h := img.Bounds().Dx(), img.Bounds().Dy()
-
-		src, err := sdl.CreateRGBSurfaceWithFormatFrom(
-			unsafe.Pointer(&img.Pix[0]),
-			int32(w), int32(h),
-			32, int32(img.Stride),
-			uint32(sdl.PIXELFORMAT_RGBA32),
-		)
-		if err != nil {
-			continue
-		}
-		dstRect := sdl.Rect{X: int32(bm.DestLeft), Y: int32(bm.DestTop), W: int32(w), H: int32(h)}
-		src.Blit(nil, surface, &dstRect)
-		src.Free()
+		rect := sdl.Rect{X: int32(bm.DestLeft), Y: int32(bm.DestTop), W: int32(w), H: int32(h)}
+		texture.Update(&rect, unsafe.Pointer(&img.Pix[0]), img.Stride)
 	}
 }
 
@@ -117,7 +106,24 @@ func mainLoop(hostPort, domain, user, password string, width, height int, swap_a
 	if err != nil {
 		return err
 	}
-	surface, _ := window.GetSurface()
+
+	renderer, err := sdl.CreateRenderer(window, -1, sdl.RENDERER_ACCELERATED)
+	if err != nil {
+		slog.Warn("hardware renderer unavailable, falling back to software", "err", err)
+		renderer, err = sdl.CreateRenderer(window, -1, sdl.RENDERER_SOFTWARE)
+		if err != nil {
+			return err
+		}
+	}
+	defer renderer.Destroy()
+
+	texture, err := renderer.CreateTexture(uint32(sdl.PIXELFORMAT_RGBA32), sdl.TEXTUREACCESS_STREAMING, int32(width), int32(height))
+	if err != nil {
+		return err
+	}
+	defer texture.Destroy()
+
+	bitmapCh := make(chan []grdp.Bitmap, 32)
 
 	rdpClient := grdp.NewRdpClient(hostPort, width, height)
 	if keyboardType != "" {
@@ -138,8 +144,11 @@ func mainLoop(hostPort, domain, user, password string, width, height int, swap_a
 	}).OnAudio(func(af rdpsnd.AudioFormat, data []byte) {
 		ap.play(af, data)
 	}).OnBitmap(func(bs []grdp.Bitmap) {
-		paintImages(bs, surface)
-		window.UpdateSurface()
+		select {
+		case bitmapCh <- bs:
+		default:
+			slog.Warn("bitmap channel full, dropping frame")
+		}
 	}).OnPointerHide(func() {
 		sdl.ShowCursor(sdl.DISABLE)
 		showCursor = false
@@ -251,13 +260,34 @@ func mainLoop(hostPort, domain, user, password string, width, height int, swap_a
 			}
 		}
 
+		// Drain incoming bitmaps and update GPU texture on the main thread.
+		dirty := false
+	drain:
+		for {
+			select {
+			case bs := <-bitmapCh:
+				paintImages(bs, texture)
+				dirty = true
+			default:
+				break drain
+			}
+		}
+		if dirty {
+			renderer.Copy(texture, nil, nil)
+			renderer.Present()
+		}
+
 		if resizePending && time.Since(resizeTime) > 500*time.Millisecond {
 			resizePending = false
 			slog.Info("Window resized, reconnecting", "width", resizeW, "height", resizeH)
 			if err := rdpClient.Reconnect(int(resizeW), int(resizeH)); err != nil {
 				slog.Error("Reconnect failed", "err", err)
 			} else {
-				surface, _ = window.GetSurface()
+				texture.Destroy()
+				texture, err = renderer.CreateTexture(uint32(sdl.PIXELFORMAT_RGBA32), sdl.TEXTUREACCESS_STREAMING, resizeW, resizeH)
+				if err != nil {
+					slog.Error("CreateTexture after resize failed", "err", err)
+				}
 			}
 		}
 	}
