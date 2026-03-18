@@ -6,10 +6,12 @@ import (
 	"log/slog"
 	"os"
 	"strings"
+	"sync"
 	"time"
 	"unsafe"
 
 	"github.com/nakagami/grdp"
+	"github.com/nakagami/grdp/plugin/rdpsnd"
 	"github.com/veandco/go-sdl2/sdl"
 )
 
@@ -33,14 +35,80 @@ func paintImages(bs []grdp.Bitmap, surface *sdl.Surface) {
 	}
 }
 
+// audioPlayer manages SDL2 audio device for RDPSND playback.
+type audioPlayer struct {
+	mu       sync.Mutex
+	deviceID sdl.AudioDeviceID
+	freq     int32
+	channels uint8
+	format   sdl.AudioFormat
+}
+
+func (a *audioPlayer) play(af rdpsnd.AudioFormat, data []byte) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+
+	var sdlFmt sdl.AudioFormat
+	switch af.BitsPerSample {
+	case 8:
+		sdlFmt = sdl.AUDIO_U8
+	case 16:
+		sdlFmt = sdl.AUDIO_S16LSB
+	default:
+		return
+	}
+
+	// Reopen device if format changed
+	if a.deviceID == 0 || a.freq != int32(af.SamplesPerSec) || a.channels != uint8(af.Channels) || a.format != sdlFmt {
+		if a.deviceID != 0 {
+			sdl.CloseAudioDevice(a.deviceID)
+			a.deviceID = 0
+		}
+		desired := sdl.AudioSpec{
+			Freq:     int32(af.SamplesPerSec),
+			Format:   sdlFmt,
+			Channels: uint8(af.Channels),
+			Samples:  4096,
+		}
+		var obtained sdl.AudioSpec
+		dev, err := sdl.OpenAudioDevice("", false, &desired, &obtained, 0)
+		if err != nil {
+			slog.Error("audio: OpenAudioDevice", "err", err)
+			return
+		}
+		a.deviceID = dev
+		a.freq = obtained.Freq
+		a.channels = obtained.Channels
+		a.format = obtained.Format
+		sdl.PauseAudioDevice(dev, false)
+		slog.Info("audio: opened device", "freq", obtained.Freq, "ch", obtained.Channels, "fmt", obtained.Format)
+	}
+
+	if err := sdl.QueueAudio(a.deviceID, data); err != nil {
+		slog.Error("audio: QueueAudio", "err", err)
+	}
+}
+
+func (a *audioPlayer) close() {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.deviceID != 0 {
+		sdl.CloseAudioDevice(a.deviceID)
+		a.deviceID = 0
+	}
+}
+
 func mainLoop(hostPort, domain, user, password string, width, height int, swap_alt_meta bool, keyboardType, keyboardLayout string) (err error) {
 	cursorCache := make(map[uint16]*sdl.Cursor)
 	showCursor := true
 
-	if err = sdl.Init(sdl.INIT_VIDEO); err != nil {
+	if err = sdl.Init(sdl.INIT_VIDEO | sdl.INIT_AUDIO); err != nil {
 		return err
 	}
 	defer sdl.Quit()
+
+	ap := &audioPlayer{}
+	defer ap.close()
 
 	sdl.StopTextInput()
 
@@ -67,6 +135,8 @@ func mainLoop(hostPort, domain, user, password string, width, height int, swap_a
 		slog.Error("on error", "err", e)
 	}).OnReady(func() {
 		slog.Info("on ready")
+	}).OnAudio(func(af rdpsnd.AudioFormat, data []byte) {
+		ap.play(af, data)
 	}).OnBitmap(func(bs []grdp.Bitmap) {
 		paintImages(bs, surface)
 		window.UpdateSurface()
