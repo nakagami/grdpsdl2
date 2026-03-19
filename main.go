@@ -18,10 +18,20 @@ import (
 func paintImages(bs []grdp.Bitmap, texture *sdl.Texture) {
 	for _, bm := range bs {
 		img := bm.RGBA()
-		// Clip to the visible destination rectangle; bitmap Width may be
-		// padded wider than the actual visible area (DestRight-DestLeft+1).
+		// Use the smaller of the destination rectangle and the actual
+		// image dimensions.  The bitmap Width may be padded wider than
+		// DestRight-DestLeft+1 (traditional bitmap updates on Linux),
+		// and conversely DestRight-DestLeft+1 may exceed Width
+		// (surface-bits commands on Windows).  In both cases we must
+		// not exceed img.Stride when updating the texture.
 		w := bm.DestRight - bm.DestLeft + 1
+		if imgW := img.Bounds().Dx(); w > imgW {
+			w = imgW
+		}
 		h := bm.DestBottom - bm.DestTop + 1
+		if imgH := img.Bounds().Dy(); h > imgH {
+			h = imgH
+		}
 		rect := sdl.Rect{X: int32(bm.DestLeft), Y: int32(bm.DestTop), W: int32(w), H: int32(h)}
 		texture.Update(&rect, unsafe.Pointer(&img.Pix[0]), img.Stride)
 	}
