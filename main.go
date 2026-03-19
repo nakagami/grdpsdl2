@@ -124,6 +124,8 @@ func mainLoop(hostPort, domain, user, password string, width, height int, swap_a
 	defer texture.Destroy()
 
 	bitmapCh := make(chan []grdp.Bitmap, 32)
+	clipboardFromServer := make(chan string, 4)
+	clipboardReqCh := make(chan chan string, 1)
 
 	rdpClient := grdp.NewRdpClient(hostPort, width, height)
 	if keyboardType != "" {
@@ -132,6 +134,21 @@ func mainLoop(hostPort, domain, user, password string, width, height int, swap_a
 	if keyboardLayout != "" {
 		rdpClient.SetKeyboardLayout(keyboardLayout)
 	}
+	rdpClient.OnClipboard(
+		func(text string) {
+			// server → client
+			select {
+			case clipboardFromServer <- text:
+			default:
+			}
+		},
+		func() string {
+			// client → server: request clipboard text from main thread
+			respCh := make(chan string, 1)
+			clipboardReqCh <- respCh
+			return <-respCh
+		},
+	)
 	err = rdpClient.Login(domain, user, password)
 	if err != nil {
 		return err
@@ -219,6 +236,8 @@ func mainLoop(hostPort, domain, user, password string, width, height int, swap_a
 	var resizePending bool
 	var resizeTime time.Time
 	var resizeW, resizeH int32
+	var lastClipboardText string
+	lastClipboardCheck := time.Now()
 
 	for !quit {
 		event := sdl.WaitEventTimeout(8)
@@ -275,6 +294,31 @@ func mainLoop(hostPort, domain, user, password string, width, height int, swap_a
 		if dirty {
 			renderer.Copy(texture, nil, nil)
 			renderer.Present()
+		}
+
+		// Handle clipboard from server (server → client)
+		select {
+		case text := <-clipboardFromServer:
+			sdl.SetClipboardText(text)
+			lastClipboardText = text
+		default:
+		}
+
+		// Handle clipboard request from server (client → server)
+		select {
+		case respCh := <-clipboardReqCh:
+			text, _ := sdl.GetClipboardText()
+			respCh <- text
+		default:
+		}
+
+		// Poll local clipboard changes
+		if time.Since(lastClipboardCheck) > 500*time.Millisecond {
+			lastClipboardCheck = time.Now()
+			if text, err := sdl.GetClipboardText(); err == nil && text != lastClipboardText {
+				lastClipboardText = text
+				rdpClient.NotifyClipboardChanged()
+			}
 		}
 
 		if resizePending && time.Since(resizeTime) > 500*time.Millisecond {
