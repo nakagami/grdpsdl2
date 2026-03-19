@@ -300,7 +300,9 @@ func mainLoop(hostPort, domain, user, password string, width, height int, swap_a
 		select {
 		case text := <-clipboardFromServer:
 			sdl.SetClipboardText(text)
-			lastClipboardText = text
+			// Don't update lastClipboardText here so that the next poll
+			// detects the change and calls NotifyClipboardChanged(),
+			// which consumes grdp's suppressNextLocalChange flag.
 		default:
 		}
 
