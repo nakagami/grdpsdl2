@@ -18,7 +18,10 @@ import (
 func paintImages(bs []grdp.Bitmap, texture *sdl.Texture) {
 	for _, bm := range bs {
 		img := bm.RGBA()
-		w, h := img.Bounds().Dx(), img.Bounds().Dy()
+		// Clip to the visible destination rectangle; bitmap Width may be
+		// padded wider than the actual visible area (DestRight-DestLeft+1).
+		w := bm.DestRight - bm.DestLeft + 1
+		h := bm.DestBottom - bm.DestTop + 1
 		rect := sdl.Rect{X: int32(bm.DestLeft), Y: int32(bm.DestTop), W: int32(w), H: int32(h)}
 		texture.Update(&rect, unsafe.Pointer(&img.Pix[0]), img.Stride)
 	}
@@ -161,6 +164,13 @@ func mainLoop(hostPort, domain, user, password string, width, height int, swap_a
 	}).OnAudio(func(af rdpsnd.AudioFormat, data []byte) {
 		ap.play(af, data)
 	}).OnBitmap(func(bs []grdp.Bitmap) {
+		// Bitmap data is borrowed from an internal pool and only valid
+		// during this callback.  Copy it before sending to the main loop.
+		for i := range bs {
+			d := make([]byte, len(bs[i].Data))
+			copy(d, bs[i].Data)
+			bs[i].Data = d
+		}
 		select {
 		case bitmapCh <- bs:
 		default:
