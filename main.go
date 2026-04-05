@@ -102,6 +102,22 @@ func mainLoop(hostPort, domain, user, password string, width, height int, swap_a
 		return err
 	}
 
+	// Pump pending OS events so any initial window-size adjustment (e.g. the
+	// OS constraining the window to the available screen area) is delivered
+	// before we start the RDP session. This prevents an immediate
+	// resize→reconnect on startup.
+	sdl.PumpEvents()
+	for {
+		ev := sdl.PollEvent()
+		if ev == nil {
+			break
+		}
+		if we, ok := ev.(*sdl.WindowEvent); ok &&
+			(we.Event == sdl.WINDOWEVENT_RESIZED || we.Event == sdl.WINDOWEVENT_SIZE_CHANGED) {
+			width = int(we.Data1)
+			height = int(we.Data2)
+		}
+	}
 	renderer, err := sdl.CreateRenderer(window, -1, sdl.RENDERER_ACCELERATED)
 	if err != nil {
 		slog.Warn("hardware renderer unavailable, falling back to software", "err", err)
