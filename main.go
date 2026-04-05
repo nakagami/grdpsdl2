@@ -6,7 +6,6 @@ import (
 	"log/slog"
 	"os"
 	"strings"
-	"sync"
 	"time"
 	"unsafe"
 
@@ -38,62 +37,42 @@ func paintImages(bs []grdp.Bitmap, texture *sdl.Texture) {
 }
 
 // audioPlayer manages SDL2 audio device for RDPSND playback.
+// The device is opened once on the main thread at startup with a fixed format
+// (44100 Hz / stereo / S16LE). play() only calls sdl.QueueAudio which is
+// thread-safe and can be invoked from any goroutine.
 type audioPlayer struct {
-	mu       sync.Mutex
 	deviceID sdl.AudioDeviceID
-	freq     int32
-	channels uint8
-	format   sdl.AudioFormat
+}
+
+// open opens the audio device on the calling (main) thread.
+func (a *audioPlayer) open() error {
+	desired := sdl.AudioSpec{
+		Freq:     44100,
+		Format:   sdl.AUDIO_S16LSB,
+		Channels: 2,
+		Samples:  4096,
+	}
+	var obtained sdl.AudioSpec
+	dev, err := sdl.OpenAudioDevice("", false, &desired, &obtained, 0)
+	if err != nil {
+		return err
+	}
+	a.deviceID = dev
+	sdl.PauseAudioDevice(dev, false)
+	slog.Debug("audio: opened device", "freq", obtained.Freq, "ch", obtained.Channels, "fmt", obtained.Format)
+	return nil
 }
 
 func (a *audioPlayer) play(af rdpsnd.AudioFormat, data []byte) {
-	a.mu.Lock()
-	defer a.mu.Unlock()
-
-	var sdlFmt sdl.AudioFormat
-	switch af.BitsPerSample {
-	case 8:
-		sdlFmt = sdl.AUDIO_U8
-	case 16:
-		sdlFmt = sdl.AUDIO_S16LSB
-	default:
+	if a.deviceID == 0 {
 		return
 	}
-
-	// Reopen device if format changed
-	if a.deviceID == 0 || a.freq != int32(af.SamplesPerSec) || a.channels != uint8(af.Channels) || a.format != sdlFmt {
-		if a.deviceID != 0 {
-			sdl.CloseAudioDevice(a.deviceID)
-			a.deviceID = 0
-		}
-		desired := sdl.AudioSpec{
-			Freq:     int32(af.SamplesPerSec),
-			Format:   sdlFmt,
-			Channels: uint8(af.Channels),
-			Samples:  4096,
-		}
-		var obtained sdl.AudioSpec
-		dev, err := sdl.OpenAudioDevice("", false, &desired, &obtained, 0)
-		if err != nil {
-			slog.Error("audio: OpenAudioDevice", "err", err)
-			return
-		}
-		a.deviceID = dev
-		a.freq = obtained.Freq
-		a.channels = obtained.Channels
-		a.format = obtained.Format
-		sdl.PauseAudioDevice(dev, false)
-		slog.Info("audio: opened device", "freq", obtained.Freq, "ch", obtained.Channels, "fmt", obtained.Format)
-	}
-
 	if err := sdl.QueueAudio(a.deviceID, data); err != nil {
 		slog.Error("audio: QueueAudio", "err", err)
 	}
 }
 
 func (a *audioPlayer) close() {
-	a.mu.Lock()
-	defer a.mu.Unlock()
 	if a.deviceID != 0 {
 		sdl.CloseAudioDevice(a.deviceID)
 		a.deviceID = 0
@@ -110,6 +89,9 @@ func mainLoop(hostPort, domain, user, password string, width, height int, swap_a
 	defer sdl.Quit()
 
 	ap := &audioPlayer{}
+	if err := ap.open(); err != nil {
+		slog.Warn("audio: failed to open device, audio disabled", "err", err)
+	}
 	defer ap.close()
 
 	sdl.StopTextInput()
@@ -501,7 +483,7 @@ func main() {
 
 	swap_alt_meta := flag.Bool("swap-alt-meta", false, "swap alt and meta key")
 	flag.Parse()
-	slog.Info("flag", "swap_alt_meta", *swap_alt_meta)
+	slog.Debug("flag", "swap_alt_meta", *swap_alt_meta)
 
 	hostPort := strings.Join([]string{os.Getenv("GRDP_HOST"), os.Getenv("GRDP_PORT")}, ":")
 	domain := os.Getenv("GRDP_DOMAIN")
