@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"os"
 	"strings"
+	"sync/atomic"
 	"time"
 	"unsafe"
 
@@ -82,6 +83,11 @@ func (a *audioPlayer) close() {
 func mainLoop(hostPort, domain, user, password string, width, height int, swap_alt_meta bool, keyboardType, keyboardLayout string) (err error) {
 	cursorCache := make(map[uint16]*sdl.Cursor)
 	showCursor := true
+
+	// reconnecting suppresses the "use of closed network connection" error
+	// that the read goroutine emits when Reconnect tears down the old TCP
+	// connection.  1 = reconnect in progress, 0 = normal operation.
+	var reconnecting atomic.Int32
 
 	if err = sdl.Init(sdl.INIT_VIDEO | sdl.INIT_AUDIO); err != nil {
 		return err
@@ -169,6 +175,10 @@ func mainLoop(hostPort, domain, user, password string, width, height int, swap_a
 	}
 
 	rdpClient.OnError(func(e error) {
+		if reconnecting.Load() != 0 {
+			slog.Debug("on error (during reconnect, suppressed)", "err", e)
+			return
+		}
 		slog.Error("on error", "err", e)
 	}).OnReady(func() {
 		slog.Info("on ready")
@@ -260,12 +270,23 @@ func mainLoop(hostPort, domain, user, password string, width, height int, swap_a
 		}
 	})
 
+	// videoStallTimeout is the maximum duration without any decoded bitmap
+	// before the video is considered frozen.  When the H.264 HW decoder
+	// falls back to software the server must resend an IDR; if that does
+	// not happen within this window we reconnect to recover.
+	const videoStallTimeout = 8 * time.Second
+
 	quit := false
 	var resizePending bool
 	var resizeTime time.Time
 	var resizeW, resizeH int32
 	var lastClipboardText string
 	lastClipboardCheck := time.Now()
+
+	// lastBitmapTime tracks when the most recent decoded bitmap arrived.
+	// Zero value means no bitmap has been received yet (initial connection
+	// phase), and the watchdog is not armed until the first bitmap.
+	var lastBitmapTime time.Time
 
 	for !quit {
 		event := sdl.WaitEventTimeout(8)
@@ -315,6 +336,7 @@ func mainLoop(hostPort, domain, user, password string, width, height int, swap_a
 			case bs := <-bitmapCh:
 				paintImages(bs, texture)
 				dirty = true
+				lastBitmapTime = time.Now()
 			default:
 				break drain
 			}
@@ -354,13 +376,42 @@ func mainLoop(hostPort, domain, user, password string, width, height int, swap_a
 		if resizePending && time.Since(resizeTime) > 500*time.Millisecond {
 			resizePending = false
 			slog.Info("Window resized, reconnecting", "width", resizeW, "height", resizeH)
-			if err := rdpClient.Reconnect(int(resizeW), int(resizeH)); err != nil {
-				slog.Error("Reconnect failed", "err", err)
+			reconnecting.Store(1)
+			reconnErr := rdpClient.Reconnect(int(resizeW), int(resizeH))
+			reconnecting.Store(0)
+			if reconnErr != nil {
+				slog.Error("Reconnect failed", "err", reconnErr)
 			} else {
+				lastBitmapTime = time.Time{} // reset watchdog for fresh session
 				texture.Destroy()
 				texture, err = renderer.CreateTexture(uint32(sdl.PIXELFORMAT_RGBA32), sdl.TEXTUREACCESS_STREAMING, resizeW, resizeH)
 				if err != nil {
 					slog.Error("CreateTexture after resize failed", "err", err)
+				}
+			}
+		}
+
+		// Video watchdog: if bitmaps stop arriving after the session was
+		// delivering frames, the H.264 decoder may be stuck (e.g. after an
+		// HW→SW fallback where the server never resends an IDR).  Reconnect
+		// to reset the decoder and recover the stream.
+		if !lastBitmapTime.IsZero() && !resizePending &&
+			time.Since(lastBitmapTime) > videoStallTimeout {
+			slog.Warn("Video stalled, reconnecting to recover",
+				"stalled", time.Since(lastBitmapTime).Round(time.Millisecond))
+			lastBitmapTime = time.Now() // prevent repeated reconnects while Reconnect runs
+			curW, curH := window.GetSize()
+			reconnecting.Store(1)
+			reconnErr := rdpClient.Reconnect(int(curW), int(curH))
+			reconnecting.Store(0)
+			if reconnErr != nil {
+				slog.Error("Video stall reconnect failed", "err", reconnErr)
+			} else {
+				lastBitmapTime = time.Time{} // reset watchdog for fresh session
+				texture.Destroy()
+				texture, err = renderer.CreateTexture(uint32(sdl.PIXELFORMAT_RGBA32), sdl.TEXTUREACCESS_STREAMING, curW, curH)
+				if err != nil {
+					slog.Error("CreateTexture after stall reconnect failed", "err", err)
 				}
 			}
 		}
