@@ -144,6 +144,14 @@ func mainLoop(hostPort, domain, user, password string, width, height int, swap_a
 	clipboardFromServer := make(chan string, 4)
 	clipboardReqCh := make(chan chan string, 1)
 
+	// lastServerActivity tracks the last time we received any data from the
+	// server (bitmap, pointer update, audio, clipboard).  Used by the video
+	// stall watchdog below to distinguish a truly stuck stream from an idle
+	// remote desktop.  Stored as UnixNano via atomic so it can be updated
+	// from network goroutines and read from the main loop without a mutex.
+	// Zero means no server activity yet (watchdog disarmed).
+	var lastServerActivity atomic.Int64
+
 	// Register a custom SDL event type to wake the main loop when bitmaps arrive.
 	bitmapEventType := sdl.RegisterEvents(1)
 
@@ -157,6 +165,7 @@ func mainLoop(hostPort, domain, user, password string, width, height int, swap_a
 	rdpClient.OnClipboard(
 		func(text string) {
 			// server → client
+			lastServerActivity.Store(time.Now().UnixNano())
 			select {
 			case clipboardFromServer <- text:
 			default:
@@ -183,8 +192,10 @@ func mainLoop(hostPort, domain, user, password string, width, height int, swap_a
 	}).OnReady(func() {
 		slog.Info("on ready")
 	}).OnAudio(func(af rdpsnd.AudioFormat, data []byte) {
+		lastServerActivity.Store(time.Now().UnixNano())
 		ap.play(af, data)
 	}).OnBitmap(func(bs []grdp.Bitmap) {
+		lastServerActivity.Store(time.Now().UnixNano())
 		// Bitmap data is borrowed from an internal pool and only valid
 		// during this callback.  Copy it before sending to the main loop.
 		for i := range bs {
@@ -205,15 +216,18 @@ func mainLoop(hostPort, domain, user, password string, width, height int, swap_a
 			sdl.PushEvent(&sdl.UserEvent{Type: bitmapEventType})
 		}
 	}).OnPointerHide(func() {
+		lastServerActivity.Store(time.Now().UnixNano())
 		sdl.ShowCursor(sdl.DISABLE)
 		showCursor = false
 	}).OnPointerCached(func(idx uint16) {
+		lastServerActivity.Store(time.Now().UnixNano())
 		if !showCursor {
 			sdl.ShowCursor(sdl.ENABLE)
 			showCursor = true
 		}
 		sdl.SetCursor(cursorCache[idx])
 	}).OnPointerUpdate(func(idx uint16, bpp uint16, x uint16, y uint16, width uint16, height uint16, mask []byte, data []byte) {
+		lastServerActivity.Store(time.Now().UnixNano())
 		if !showCursor {
 			sdl.ShowCursor(sdl.ENABLE)
 			showCursor = true
@@ -270,11 +284,14 @@ func mainLoop(hostPort, domain, user, password string, width, height int, swap_a
 		}
 	})
 
-	// videoStallTimeout is the maximum duration without any decoded bitmap
-	// before the video is considered frozen.  When the H.264 HW decoder
-	// falls back to software the server must resend an IDR; if that does
-	// not happen within this window we reconnect to recover.
-	const videoStallTimeout = 8 * time.Second
+	// videoStallTimeout is the maximum duration without ANY response from
+	// the server (bitmap, pointer, audio, clipboard) before the session is
+	// considered frozen.  An idle remote desktop legitimately sends no
+	// frames for long periods, so we must not key this off bitmaps alone.
+	// When the H.264 HW decoder falls back to software the server must
+	// resend an IDR; if no traffic at all arrives within this window we
+	// reconnect to recover.
+	const videoStallTimeout = 20 * time.Second
 
 	quit := false
 	var resizePending bool
@@ -282,11 +299,6 @@ func mainLoop(hostPort, domain, user, password string, width, height int, swap_a
 	var resizeW, resizeH int32
 	var lastClipboardText string
 	lastClipboardCheck := time.Now()
-
-	// lastBitmapTime tracks when the most recent decoded bitmap arrived.
-	// Zero value means no bitmap has been received yet (initial connection
-	// phase), and the watchdog is not armed until the first bitmap.
-	var lastBitmapTime time.Time
 
 	for !quit {
 		event := sdl.WaitEventTimeout(8)
@@ -336,7 +348,6 @@ func mainLoop(hostPort, domain, user, password string, width, height int, swap_a
 			case bs := <-bitmapCh:
 				paintImages(bs, texture)
 				dirty = true
-				lastBitmapTime = time.Now()
 			default:
 				break drain
 			}
@@ -382,7 +393,7 @@ func mainLoop(hostPort, domain, user, password string, width, height int, swap_a
 			if reconnErr != nil {
 				slog.Error("Reconnect failed", "err", reconnErr)
 			} else {
-				lastBitmapTime = time.Time{} // reset watchdog for fresh session
+				lastServerActivity.Store(0) // reset watchdog for fresh session
 				texture.Destroy()
 				texture, err = renderer.CreateTexture(uint32(sdl.PIXELFORMAT_RGBA32), sdl.TEXTUREACCESS_STREAMING, resizeW, resizeH)
 				if err != nil {
@@ -391,27 +402,33 @@ func mainLoop(hostPort, domain, user, password string, width, height int, swap_a
 			}
 		}
 
-		// Video watchdog: if bitmaps stop arriving after the session was
-		// delivering frames, the H.264 decoder may be stuck (e.g. after an
-		// HW→SW fallback where the server never resends an IDR).  Reconnect
-		// to reset the decoder and recover the stream.
-		if !lastBitmapTime.IsZero() && !resizePending &&
-			time.Since(lastBitmapTime) > videoStallTimeout {
-			slog.Warn("Video stalled, reconnecting to recover",
-				"stalled", time.Since(lastBitmapTime).Round(time.Millisecond))
-			lastBitmapTime = time.Now() // prevent repeated reconnects while Reconnect runs
-			curW, curH := window.GetSize()
-			reconnecting.Store(1)
-			reconnErr := rdpClient.Reconnect(int(curW), int(curH))
-			reconnecting.Store(0)
-			if reconnErr != nil {
-				slog.Error("Video stall reconnect failed", "err", reconnErr)
-			} else {
-				lastBitmapTime = time.Time{} // reset watchdog for fresh session
-				texture.Destroy()
-				texture, err = renderer.CreateTexture(uint32(sdl.PIXELFORMAT_RGBA32), sdl.TEXTUREACCESS_STREAMING, curW, curH)
-				if err != nil {
-					slog.Error("CreateTexture after stall reconnect failed", "err", err)
+		// Video watchdog: if no traffic of any kind arrives from the server
+		// for a long time after the session was active, the H.264 decoder
+		// may be stuck (e.g. after an HW→SW fallback where the server never
+		// resends an IDR).  Reconnect to reset the decoder and recover the
+		// stream.  We track all server-originated activity (bitmaps,
+		// pointer updates, audio, clipboard) so that an idle desktop with
+		// nothing to redraw does not trigger a false-positive reconnect.
+		lastNS := lastServerActivity.Load()
+		if lastNS != 0 && !resizePending {
+			elapsed := time.Since(time.Unix(0, lastNS))
+			if elapsed > videoStallTimeout {
+				slog.Warn("Video stalled, reconnecting to recover",
+					"stalled", elapsed.Round(time.Millisecond))
+				lastServerActivity.Store(time.Now().UnixNano()) // prevent repeated reconnects while Reconnect runs
+				curW, curH := window.GetSize()
+				reconnecting.Store(1)
+				reconnErr := rdpClient.Reconnect(int(curW), int(curH))
+				reconnecting.Store(0)
+				if reconnErr != nil {
+					slog.Error("Video stall reconnect failed", "err", reconnErr)
+				} else {
+					lastServerActivity.Store(0) // reset watchdog for fresh session
+					texture.Destroy()
+					texture, err = renderer.CreateTexture(uint32(sdl.PIXELFORMAT_RGBA32), sdl.TEXTUREACCESS_STREAMING, curW, curH)
+					if err != nil {
+						slog.Error("CreateTexture after stall reconnect failed", "err", err)
+					}
 				}
 			}
 		}
