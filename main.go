@@ -291,7 +291,7 @@ func mainLoop(hostPort, domain, user, password string, width, height int, swap_a
 	// When the H.264 HW decoder falls back to software the server must
 	// resend an IDR; if no traffic at all arrives within this window we
 	// reconnect to recover.
-	const videoStallTimeout = 20 * time.Second
+	const videoStallTimeout = 3 * time.Second
 
 	quit := false
 	var resizePending bool
