@@ -255,14 +255,14 @@ func mainLoop(hostPort, domain, user, password string, width, height int, swap_a
 			n := len(data) / 3
 			rgba := make([]byte, n*4)
 			for i := 0; i < n; i++ {
-				rgba[4*i+0] = data[3*i+0]
-				rgba[4*i+1] = data[3*i+1]
-				rgba[4*i+2] = data[3*i+2]
-				if data[3*i+0] == 0 && data[3*i+1] == 0 && data[3*i+2] == 0 {
-					rgba[4*i+3] = 0
-				} else {
-					rgba[4*i+3] = 255
+				b, g, r := data[3*i], data[3*i+1], data[3*i+2]
+				// Branchless alpha: 0x00 when all channels are zero, 0xFF otherwise.
+				// This avoids a conditional branch that would inhibit auto-vectorisation.
+				var a byte
+				if b|g|r != 0 {
+					a = 0xFF
 				}
+				rgba[4*i], rgba[4*i+1], rgba[4*i+2], rgba[4*i+3] = b, g, r, a
 			}
 			data = rgba
 		}
