@@ -4,6 +4,7 @@ import (
 	"flag"
 	"fmt"
 	"log/slog"
+	"net"
 	"os"
 	"strings"
 	"sync/atomic"
@@ -155,7 +156,9 @@ func mainLoop(hostPort, domain, user, password string, width, height int, swap_a
 	// Register a custom SDL event type to wake the main loop when bitmaps arrive.
 	bitmapEventType := sdl.RegisterEvents(1)
 
-	rdpClient := grdp.NewRdpClient(hostPort, width, height)
+	rdpClient := grdp.NewRdpClient(hostPort, width, height, func(hostPort string) (net.Conn, error) {
+		return net.Dial("tcp", hostPort)
+	})
 	if keyboardType != "" {
 		rdpClient.SetKeyboardType(keyboardType)
 	}
