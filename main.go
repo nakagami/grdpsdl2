@@ -279,20 +279,6 @@ func mainLoop(hostPort, domain, user, password string, width, height int, swap_a
 		}
 		defer surface.Free()
 
-		// swap lines
-		line_len := int(width) * 4
-		upper_line := 0
-		lower_line := int(height) - 1
-		tmp := make([]byte, line_len)
-		for upper_line < int(height)/2 {
-			upper := data[upper_line*line_len : upper_line*line_len+line_len]
-			lower := data[lower_line*line_len : lower_line*line_len+line_len]
-			copy(tmp, upper)
-			copy(upper, lower)
-			copy(lower, tmp)
-			upper_line++
-			lower_line--
-		}
 		cursor := sdl.CreateColorCursor(surface, int32(x), int32(y))
 
 		if cursor != nil {
@@ -307,10 +293,15 @@ func mainLoop(hostPort, domain, user, password string, width, height int, swap_a
 	// the server (bitmap, pointer, audio, clipboard) before the session is
 	// considered frozen.  An idle remote desktop legitimately sends no
 	// frames for long periods, so we must not key this off bitmaps alone.
-	// When the H.264 HW decoder falls back to software the server must
-	// resend an IDR; if no traffic at all arrives within this window we
-	// reconnect to recover.
-	const videoStallTimeout = 3 * time.Second
+	//
+	// The timeout must be long enough to accommodate the full recovery cycle
+	// when the H.264 HW decoder (e.g. VideoToolbox) temporarily produces
+	// null frames: grdp's internal freeze threshold (~2 s) + hard reset +
+	// IDR request round-trip + server re-encode + first decoded frame.
+	// Empirically this cycle can take 5–8 seconds, so 3 s was too short and
+	// caused spurious reconnects.  10 s is generous yet still catches a
+	// truly stuck session.
+	const videoStallTimeout = 10 * time.Second
 
 	quit := false
 	var resizePending bool
