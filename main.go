@@ -7,6 +7,7 @@ import (
 	"net"
 	"os"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 	"unsafe"
@@ -84,6 +85,10 @@ func (a *audioPlayer) close() {
 func mainLoop(hostPort, domain, user, password string, width, height int, swap_alt_meta bool, keyboardType, keyboardLayout string) (err error) {
 	cursorCache := make(map[uint16]*sdl.Cursor)
 	showCursor := true
+
+	// bitmapBufPool reuses backing arrays for bitmap data copies, reducing
+	// GC pressure when many large bitmap updates arrive per second.
+	var bitmapBufPool sync.Pool
 
 	// reconnecting suppresses the "use of closed network connection" error
 	// that the read goroutine emits when Reconnect tears down the old TCP
@@ -199,18 +204,29 @@ func mainLoop(hostPort, domain, user, password string, width, height int, swap_a
 		ap.play(af, data)
 	}).OnBitmap(func(bs []grdp.Bitmap) {
 		lastServerActivity.Store(time.Now().UnixNano())
-		// Bitmap data is borrowed from an internal pool and only valid
-		// during this callback.  Copy it before sending to the main loop.
+		// Bitmap.Data is borrowed from grdp's internal pool; copy it before
+		// returning from this callback.  Reuse pooled buffers to avoid
+		// allocating fresh backing arrays on every frame.
 		for i := range bs {
-			d := make([]byte, len(bs[i].Data))
-			copy(d, bs[i].Data)
-			bs[i].Data = d
+			src := bs[i].Data
+			buf, _ := bitmapBufPool.Get().([]byte)
+			if cap(buf) < len(src) {
+				buf = make([]byte, len(src))
+			} else {
+				buf = buf[:len(src)]
+			}
+			copy(buf, src)
+			bs[i].Data = buf
 		}
 		sent := false
 		select {
 		case bitmapCh <- bs:
 			sent = true
 		default:
+			// Return buffers to pool since we're dropping this frame.
+			for i := range bs {
+				bitmapBufPool.Put(bs[i].Data)
+			}
 			slog.Warn("bitmap channel full, dropping frame")
 		}
 		// Wake the main loop immediately so it renders without waiting for
@@ -350,6 +366,9 @@ func mainLoop(hostPort, domain, user, password string, width, height int, swap_a
 			select {
 			case bs := <-bitmapCh:
 				paintImages(bs, texture)
+				for i := range bs {
+					bitmapBufPool.Put(bs[i].Data)
+				}
 				dirty = true
 			default:
 				break drain
