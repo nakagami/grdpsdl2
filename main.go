@@ -19,23 +19,43 @@ import (
 
 func paintImages(bs []grdp.Bitmap, texture *sdl.Texture) {
 	for _, bm := range bs {
-		img := bm.RGBA()
-		// Use the smaller of the destination rectangle and the actual
-		// image dimensions.  The bitmap Width may be padded wider than
-		// DestRight-DestLeft+1 (traditional bitmap updates on Linux),
-		// and conversely DestRight-DestLeft+1 may exceed Width
-		// (surface-bits commands on Windows).  In both cases we must
-		// not exceed img.Stride when updating the texture.
-		w := bm.DestRight - bm.DestLeft + 1
-		if imgW := img.Bounds().Dx(); w > imgW {
-			w = imgW
+		// The texture uses PIXELFORMAT_BGRA32, so grdp's native BGRA data
+		// (BitsPerPixel==4) can be passed directly — no copy or byte-swap needed.
+		// For legacy bit-depths (2/3 bpp), bm.RGBA() converts to RGBA; we then
+		// swap R↔B in-place to match the BGRA32 texture format.  Those paths
+		// are uncommon outside of traditional RDP bitmap updates.
+		if bm.BitsPerPixel == 4 {
+			// Fast path: BGRA data passes straight to the BGRA32 texture.
+			w := bm.DestRight - bm.DestLeft + 1
+			if w > bm.Width {
+				w = bm.Width
+			}
+			h := bm.DestBottom - bm.DestTop + 1
+			if h > bm.Height {
+				h = bm.Height
+			}
+			rect := sdl.Rect{X: int32(bm.DestLeft), Y: int32(bm.DestTop), W: int32(w), H: int32(h)}
+			texture.Update(&rect, unsafe.Pointer(&bm.Data[0]), bm.Width*4)
+		} else {
+			// Slow path: convert to RGBA, then swap R↔B for BGRA32 texture.
+			// Use the smaller of the destination rectangle and the actual
+			// image dimensions (same clamping as before).
+			img := bm.RGBA()
+			w := bm.DestRight - bm.DestLeft + 1
+			if imgW := img.Bounds().Dx(); w > imgW {
+				w = imgW
+			}
+			h := bm.DestBottom - bm.DestTop + 1
+			if imgH := img.Bounds().Dy(); h > imgH {
+				h = imgH
+			}
+			p := img.Pix
+			for i := 0; i < len(p); i += 4 {
+				p[i], p[i+2] = p[i+2], p[i]
+			}
+			rect := sdl.Rect{X: int32(bm.DestLeft), Y: int32(bm.DestTop), W: int32(w), H: int32(h)}
+			texture.Update(&rect, unsafe.Pointer(&img.Pix[0]), img.Stride)
 		}
-		h := bm.DestBottom - bm.DestTop + 1
-		if imgH := img.Bounds().Dy(); h > imgH {
-			h = imgH
-		}
-		rect := sdl.Rect{X: int32(bm.DestLeft), Y: int32(bm.DestTop), W: int32(w), H: int32(h)}
-		texture.Update(&rect, unsafe.Pointer(&img.Pix[0]), img.Stride)
 	}
 }
 
@@ -82,6 +102,20 @@ func (a *audioPlayer) close() {
 	}
 }
 
+// yuvFrame carries a decoded H.264 frame in I420 planar format from the grdp
+// callback to the SDL2 main thread.  buf is the single backing allocation that
+// holds all three planes; it is returned to yuvBufPool after the texture upload.
+type yuvFrame struct {
+	destX, destY, w, h int
+	y                  []byte
+	yStride            int
+	u                  []byte
+	uStride            int
+	v                  []byte
+	vStride            int
+	buf                []byte // entire backing store: y||u||v
+}
+
 func mainLoop(hostPort, domain, user, password string, width, height int, swap_alt_meta bool, keyboardType, keyboardLayout string) (err error) {
 	cursorCache := make(map[uint16]*sdl.Cursor)
 	showCursor := true
@@ -89,6 +123,9 @@ func mainLoop(hostPort, domain, user, password string, width, height int, swap_a
 	// bitmapBufPool reuses backing arrays for bitmap data copies, reducing
 	// GC pressure when many large bitmap updates arrive per second.
 	var bitmapBufPool sync.Pool
+	// yuvBufPool reuses backing arrays for I420 plane copies (one allocation
+	// per frame holds Y+U+V contiguously, ≈3MB at 1920×1080).
+	var yuvBufPool sync.Pool
 
 	// reconnecting suppresses the "use of closed network connection" error
 	// that the read goroutine emits when Reconnect tears down the old TCP
@@ -140,13 +177,45 @@ func mainLoop(hostPort, domain, user, password string, width, height int, swap_a
 	}
 	defer renderer.Destroy()
 
-	texture, err := renderer.CreateTexture(uint32(sdl.PIXELFORMAT_RGBA32), sdl.TEXTUREACCESS_STREAMING, int32(width), int32(height))
+	// texture is a BGRA32 streaming texture used for non-H264 bitmap patches
+	// (legacy RDP updates, RDPGFX non-AVC codecs, etc.).  It uses BLENDMODE_BLEND
+	// so transparent pixels (alpha=0) reveal the H264 IYUV base below.
+	// For sessions without H264 the renderer background is black, which shows
+	// through transparent pixels, but all real content has alpha=255 so it is fine.
+	texture, err := renderer.CreateTexture(uint32(sdl.PIXELFORMAT_BGRA32), sdl.TEXTUREACCESS_STREAMING, int32(width), int32(height))
 	if err != nil {
 		return err
 	}
 	defer texture.Destroy()
+	texture.SetBlendMode(sdl.BLENDMODE_BLEND)
+
+	// yuvTexture holds the most recent H264 frame in I420 (IYUV) format.
+	// SDL2's renderer uses hardware YUV→RGB shaders for IYUV textures,
+	// offloading colour conversion entirely from the CPU.
+	// On software renderers SDL2 does the conversion in software — no separate
+	// GPU/non-GPU code path is needed.
+	yuvTexture, err := renderer.CreateTexture(uint32(sdl.PIXELFORMAT_IYUV), sdl.TEXTUREACCESS_STREAMING, int32(width), int32(height))
+	if err != nil {
+		// IYUV unsupported (unusual but possible on some drivers); fall back to
+		// BGRA-only rendering by setting yuvTexture to nil.
+		slog.Warn("IYUV texture unsupported, H264 will render via BGRA fallback", "err", err)
+		yuvTexture = nil
+	}
+	if yuvTexture != nil {
+		defer yuvTexture.Destroy()
+	}
+
+	// overlayZero is a pre-zeroed buffer used to reset the overlay texture to
+	// fully transparent (BGRA 0,0,0,0) after each H264 full-frame update,
+	// ensuring stale non-H264 patches do not obscure the new H264 baseline.
+	// Allocated once; reused on every H264 frame and on texture recreation.
+	overlayZero := make([]byte, width*height*4)
+	// Initialise texture to transparent now so blending is correct from the first frame.
+	texture.Update(nil, unsafe.Pointer(&overlayZero[0]), width*4)
 
 	bitmapCh := make(chan []grdp.Bitmap, 128)
+	yuvCh := make(chan yuvFrame, 128)
+	yuvReady := false // true once any H264 I420 frame has been rendered
 	clipboardFromServer := make(chan string, 4)
 	clipboardReqCh := make(chan chan string, 1)
 
@@ -289,6 +358,50 @@ func mainLoop(hostPort, domain, user, password string, width, height int, swap_a
 		}
 	})
 
+	// OnH264I420 receives decoded H264 frames in I420 planar format.
+	// When the SDL2 IYUV texture is available this callback is called instead
+	// of OnBitmap for H264 frames, so the YUV→RGB conversion is done by the
+	// GPU (or SDL2's software renderer) rather than on the CPU.
+	// The plane slices are valid only for the duration of the callback; we
+	// copy them into a pooled buffer and send to yuvCh for the main thread.
+	if yuvTexture != nil {
+		rdpClient.OnH264I420(func(destX, destY, w, h int, y []byte, yStride int, u []byte, uStride int, v []byte, vStride int) {
+			lastServerActivity.Store(time.Now().UnixNano())
+			ph := (h + 1) / 2
+			yLen := yStride * h
+			uLen := uStride * ph
+			vLen := vStride * ph
+			totalLen := yLen + uLen + vLen
+			buf, _ := yuvBufPool.Get().([]byte)
+			if cap(buf) < totalLen {
+				buf = make([]byte, totalLen)
+			} else {
+				buf = buf[:totalLen]
+			}
+			copy(buf[:yLen], y[:yLen])
+			copy(buf[yLen:yLen+uLen], u[:uLen])
+			copy(buf[yLen+uLen:yLen+uLen+vLen], v[:vLen])
+			frame := yuvFrame{
+				destX: destX, destY: destY, w: w, h: h,
+				y: buf[:yLen], yStride: yStride,
+				u: buf[yLen : yLen+uLen], uStride: uStride,
+				v: buf[yLen+uLen : yLen+uLen+vLen], vStride: vStride,
+				buf: buf,
+			}
+			sent := false
+			select {
+			case yuvCh <- frame:
+				sent = true
+			default:
+				yuvBufPool.Put(buf)
+				slog.Warn("yuv channel full, dropping H264 frame")
+			}
+			if sent && bitmapEventType != sdl.FIRSTEVENT {
+				sdl.PushEvent(&sdl.UserEvent{Type: bitmapEventType})
+			}
+		})
+	}
+
 	// videoStallTimeout is the maximum duration without ANY response from
 	// the server (bitmap, pointer, audio, clipboard) before the session is
 	// considered frozen.  An idle remote desktop legitimately sends no
@@ -352,6 +465,25 @@ func mainLoop(hostPort, domain, user, password string, width, height int, swap_a
 
 		// Drain incoming bitmaps and update GPU texture on the main thread.
 		dirty := false
+
+		// Drain H264 I420 frames: upload to IYUV texture and clear the overlay
+		// so stale non-H264 patches don't obscure the new baseline frame.
+	drainYUV:
+		for {
+			select {
+			case frame := <-yuvCh:
+				// Clear overlay to transparent: the new I420 frame is the fresh baseline.
+				texture.Update(nil, unsafe.Pointer(&overlayZero[0]), width*4)
+				rect := sdl.Rect{X: int32(frame.destX), Y: int32(frame.destY), W: int32(frame.w), H: int32(frame.h)}
+				yuvTexture.UpdateYUV(&rect, frame.y, frame.yStride, frame.u, frame.uStride, frame.v, frame.vStride)
+				yuvBufPool.Put(frame.buf)
+				yuvReady = true
+				dirty = true
+			default:
+				break drainYUV
+			}
+		}
+
 	drain:
 		for {
 			select {
@@ -366,6 +498,11 @@ func mainLoop(hostPort, domain, user, password string, width, height int, swap_a
 			}
 		}
 		if dirty {
+			if yuvReady {
+				// H264 session: render IYUV base first, then overlay patches on top.
+				renderer.Copy(yuvTexture, nil, nil)
+			}
+			// Always render the overlay (non-H264 bitmaps, or full content when yuvReady=false).
 			renderer.Copy(texture, nil, nil)
 			renderer.Present()
 		}
@@ -408,10 +545,23 @@ func mainLoop(hostPort, domain, user, password string, width, height int, swap_a
 			} else {
 				lastServerActivity.Store(0) // reset watchdog for fresh session
 				texture.Destroy()
-				texture, err = renderer.CreateTexture(uint32(sdl.PIXELFORMAT_RGBA32), sdl.TEXTUREACCESS_STREAMING, resizeW, resizeH)
+				texture, err = renderer.CreateTexture(uint32(sdl.PIXELFORMAT_BGRA32), sdl.TEXTUREACCESS_STREAMING, resizeW, resizeH)
 				if err != nil {
 					slog.Error("CreateTexture after resize failed", "err", err)
+				} else {
+					texture.SetBlendMode(sdl.BLENDMODE_BLEND)
+					overlayZero = make([]byte, int(resizeW)*int(resizeH)*4)
+					texture.Update(nil, unsafe.Pointer(&overlayZero[0]), int(resizeW)*4)
 				}
+				if yuvTexture != nil {
+					yuvTexture.Destroy()
+					yuvTexture, err = renderer.CreateTexture(uint32(sdl.PIXELFORMAT_IYUV), sdl.TEXTUREACCESS_STREAMING, resizeW, resizeH)
+					if err != nil {
+						slog.Warn("IYUV recreate failed after resize", "err", err)
+						yuvTexture = nil
+					}
+				}
+				yuvReady = false
 			}
 		}
 
@@ -438,10 +588,23 @@ func mainLoop(hostPort, domain, user, password string, width, height int, swap_a
 				} else {
 					lastServerActivity.Store(0) // reset watchdog for fresh session
 					texture.Destroy()
-					texture, err = renderer.CreateTexture(uint32(sdl.PIXELFORMAT_RGBA32), sdl.TEXTUREACCESS_STREAMING, curW, curH)
+					texture, err = renderer.CreateTexture(uint32(sdl.PIXELFORMAT_BGRA32), sdl.TEXTUREACCESS_STREAMING, curW, curH)
 					if err != nil {
 						slog.Error("CreateTexture after stall reconnect failed", "err", err)
+					} else {
+						texture.SetBlendMode(sdl.BLENDMODE_BLEND)
+						overlayZero = make([]byte, int(curW)*int(curH)*4)
+						texture.Update(nil, unsafe.Pointer(&overlayZero[0]), int(curW)*4)
 					}
+					if yuvTexture != nil {
+						yuvTexture.Destroy()
+						yuvTexture, err = renderer.CreateTexture(uint32(sdl.PIXELFORMAT_IYUV), sdl.TEXTUREACCESS_STREAMING, curW, curH)
+						if err != nil {
+							slog.Warn("IYUV recreate failed after stall reconnect", "err", err)
+							yuvTexture = nil
+						}
+					}
+					yuvReady = false
 				}
 			}
 		}
