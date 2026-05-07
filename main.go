@@ -458,7 +458,7 @@ func mainLoop(hostPort, domain, user, password string, width, height int, swap_a
 
 			case *sdl.MouseWheelEvent:
 				if t.X == 0 {
-					rdpClient.MouseWheel(int(t.Y) * 10)
+					rdpClient.MouseWheel(int(t.Y))
 				}
 			}
 		}
