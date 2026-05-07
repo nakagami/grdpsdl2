@@ -231,7 +231,10 @@ func mainLoop(hostPort, domain, user, password string, width, height int, swap_a
 	bitmapEventType := sdl.RegisterEvents(1)
 
 	rdpClient := grdp.NewRdpClient(hostPort, width, height, func(hostPort string) (net.Conn, error) {
-		return net.Dial("tcp", hostPort)
+		dialer := &net.Dialer{
+			KeepAlive: 300 * time.Second,
+		}
+		return dialer.Dial("tcp", hostPort)
 	})
 	if keyboardType != "" {
 		rdpClient.SetKeyboardType(keyboardType)
