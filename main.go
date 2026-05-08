@@ -20,6 +20,11 @@ import (
 
 const sdlPixelFormatNV12 = uint32(0x3231564E) // SDL_PIXELFORMAT_NV12
 
+// maxAudioQueueBytes is the soft cap on SDL2's queued audio buffer (≈1 s of
+// PCM 44100 Hz / 2 ch / 16-bit).  When the queue exceeds this limit, incoming
+// audio packets are dropped to prevent ever-growing latency.
+const maxAudioQueueBytes = 176400
+
 // paintImages uploads each bitmap patch into the SDL2 streaming texture.
 // Dirty rects are appended to dirtyRects so the caller can later clear only
 // those regions (instead of the entire texture) when a new H.264 frame arrives.
@@ -175,8 +180,19 @@ func (a *audioPlayer) play(af rdpsnd.AudioFormat, data []byte) {
 	if a.deviceID == 0 {
 		return
 	}
+	if sdl.GetQueuedAudioSize(a.deviceID) >= maxAudioQueueBytes {
+		return // drop to prevent latency buildup
+	}
 	if err := sdl.QueueAudio(a.deviceID, data); err != nil {
 		slog.Error("audio: QueueAudio", "err", err)
+	}
+}
+
+// reset discards all buffered audio data.  Called on server-side audio reset
+// (e.g. seek) so stale audio does not keep playing after the stream restarts.
+func (a *audioPlayer) reset() {
+	if a.deviceID != 0 {
+		sdl.ClearQueuedAudio(a.deviceID)
 	}
 }
 
@@ -239,6 +255,12 @@ func mainLoop(hostPort, domain, user, password string, width, height int, swap_a
 	// that the read goroutine emits when Reconnect tears down the old TCP
 	// connection.  1 = reconnect in progress, 0 = normal operation.
 	var reconnecting atomic.Int32
+
+	// eventPending prevents redundant SDL user-event pushes when H.264 or
+	// bitmap callbacks fire faster than the main loop drains them.  Using
+	// CompareAndSwap ensures at most one pending wake-up event sits in the
+	// SDL event queue at any time.
+	var eventPending atomic.Bool
 
 	if err = sdl.Init(sdl.INIT_VIDEO | sdl.INIT_AUDIO); err != nil {
 		return err
@@ -402,7 +424,8 @@ func mainLoop(hostPort, domain, user, password string, width, height int, swap_a
 	// (non-H264 bitmap updates) since the last H264 frame.  When the next H264
 	// frame arrives we clear only these rects instead of zeroing the entire
 	// screen, cutting GPU texture-upload bandwidth significantly.
-	var overlayDirtyRects []sdl.Rect
+	// Pre-allocated with capacity 64 to avoid append reallocation on typical frames.
+	overlayDirtyRects := make([]sdl.Rect, 0, 64)
 
 	// lastServerActivity tracks the last time we received any data from the
 	// server (bitmap, pointer update, audio, clipboard).  Used by the video
@@ -459,6 +482,9 @@ func mainLoop(hostPort, domain, user, password string, width, height int, swap_a
 	}).OnAudio(func(af rdpsnd.AudioFormat, data []byte) {
 		lastServerActivity.Store(time.Now().UnixNano())
 		ap.play(af, data)
+	}).OnAudioReset(func() {
+		slog.Debug("audio: reset")
+		ap.reset()
 	}).OnBitmap(func(bs []grdp.Bitmap) {
 		lastServerActivity.Store(time.Now().UnixNano())
 		// Bitmap.Data is borrowed from grdp's internal pool; copy it before
@@ -488,7 +514,7 @@ func mainLoop(hostPort, domain, user, password string, width, height int, swap_a
 		}
 		// Wake the main loop immediately so it renders without waiting for
 		// WaitEventTimeout to expire.
-		if sent && bitmapEventType != sdl.FIRSTEVENT {
+		if sent && bitmapEventType != sdl.FIRSTEVENT && eventPending.CompareAndSwap(false, true) {
 			sdl.PushEvent(&sdl.UserEvent{Type: bitmapEventType})
 		}
 	}).OnPointerHide(func() {
@@ -610,7 +636,7 @@ func mainLoop(hostPort, domain, user, password string, width, height int, swap_a
 						slog.Warn("yuv channel full, dropping NV12 frame")
 					}
 				}
-				if bitmapEventType != sdl.FIRSTEVENT {
+				if bitmapEventType != sdl.FIRSTEVENT && eventPending.CompareAndSwap(false, true) {
 					sdl.PushEvent(&sdl.UserEvent{Type: bitmapEventType})
 				}
 			})
@@ -682,7 +708,7 @@ func mainLoop(hostPort, domain, user, password string, width, height int, swap_a
 						slog.Warn("yuv channel full, dropping I420 frame")
 					}
 				}
-				if bitmapEventType != sdl.FIRSTEVENT {
+				if bitmapEventType != sdl.FIRSTEVENT && eventPending.CompareAndSwap(false, true) {
 					sdl.PushEvent(&sdl.UserEvent{Type: bitmapEventType})
 				}
 			})
@@ -702,6 +728,40 @@ func mainLoop(hostPort, domain, user, password string, width, height int, swap_a
 	// caused spurious reconnects.  10 s is generous yet still catches a
 	// truly stuck session.
 	const videoStallTimeout = 10 * time.Second
+
+	// resetAfterReconnect recreates textures and resets rendering state after a
+	// successful Reconnect.  Extracted to avoid duplicating ~25 lines between
+	// the resize-reconnect and video-stall-reconnect paths.
+	resetAfterReconnect := func(w, h int32) {
+		lastServerActivity.Store(0)
+		overlayDirtyRects = overlayDirtyRects[:0]
+		texture.Destroy()
+		var rerr error
+		texture, rerr = renderer.CreateTexture(uint32(sdl.PIXELFORMAT_BGRA32), sdl.TEXTUREACCESS_STREAMING, w, h)
+		if rerr != nil {
+			slog.Error("CreateTexture after reconnect failed", "err", rerr)
+		} else {
+			texture.SetBlendMode(sdl.BLENDMODE_BLEND)
+			overlayZero = make([]byte, int(w)*int(h)*4)
+			texture.Update(nil, unsafe.Pointer(&overlayZero[0]), int(w)*4)
+		}
+		if yuvTexture != nil {
+			drainPreLock()
+			yuvTexture.Destroy()
+			yuvTexture, rerr = renderer.CreateTexture(yuvTextureFormat, sdl.TEXTUREACCESS_STREAMING, w, h)
+			if rerr != nil {
+				slog.Warn("IYUV recreate failed after reconnect", "err", rerr)
+				yuvTexture = nil
+				yuvPrimaryPath = false
+			} else if stage := preLockYUV(yuvTexture, int(w), int(h), yuvTextureFormat); stage != nil {
+				yuvPrimaryPath = true
+				yuvStageCh <- stage
+			} else {
+				yuvPrimaryPath = false
+			}
+		}
+		yuvReady = false
+	}
 
 	quit := false
 	var resizePending bool
@@ -762,6 +822,8 @@ func mainLoop(hostPort, domain, user, password string, width, height int, swap_a
 		}
 
 		// Drain incoming bitmaps and update GPU texture on the main thread.
+		// Clear the event-pending flag first so the next callback push is not suppressed.
+		eventPending.Store(false)
 		dirty := false
 
 		// Process H.264 YUV frames.
@@ -884,33 +946,7 @@ func mainLoop(hostPort, domain, user, password string, width, height int, swap_a
 			if reconnErr != nil {
 				slog.Error("Reconnect failed", "err", reconnErr)
 			} else {
-				lastServerActivity.Store(0) // reset watchdog for fresh session
-				overlayDirtyRects = overlayDirtyRects[:0]
-				texture.Destroy()
-				texture, err = renderer.CreateTexture(uint32(sdl.PIXELFORMAT_BGRA32), sdl.TEXTUREACCESS_STREAMING, resizeW, resizeH)
-				if err != nil {
-					slog.Error("CreateTexture after resize failed", "err", err)
-				} else {
-					texture.SetBlendMode(sdl.BLENDMODE_BLEND)
-					overlayZero = make([]byte, int(resizeW)*int(resizeH)*4)
-					texture.Update(nil, unsafe.Pointer(&overlayZero[0]), int(resizeW)*4)
-				}
-				if yuvTexture != nil {
-					drainPreLock()
-					yuvTexture.Destroy()
-					yuvTexture, err = renderer.CreateTexture(yuvTextureFormat, sdl.TEXTUREACCESS_STREAMING, resizeW, resizeH)
-					if err != nil {
-						slog.Warn("IYUV recreate failed after resize", "err", err)
-						yuvTexture = nil
-						yuvPrimaryPath = false
-					} else if stage := preLockYUV(yuvTexture, int(resizeW), int(resizeH), yuvTextureFormat); stage != nil {
-						yuvPrimaryPath = true
-						yuvStageCh <- stage
-					} else {
-						yuvPrimaryPath = false
-					}
-				}
-				yuvReady = false
+				resetAfterReconnect(resizeW, resizeH)
 			}
 		}
 
@@ -935,33 +971,7 @@ func mainLoop(hostPort, domain, user, password string, width, height int, swap_a
 				if reconnErr != nil {
 					slog.Error("Video stall reconnect failed", "err", reconnErr)
 				} else {
-					lastServerActivity.Store(0) // reset watchdog for fresh session
-					overlayDirtyRects = overlayDirtyRects[:0]
-					texture.Destroy()
-					texture, err = renderer.CreateTexture(uint32(sdl.PIXELFORMAT_BGRA32), sdl.TEXTUREACCESS_STREAMING, curW, curH)
-					if err != nil {
-						slog.Error("CreateTexture after stall reconnect failed", "err", err)
-					} else {
-						texture.SetBlendMode(sdl.BLENDMODE_BLEND)
-						overlayZero = make([]byte, int(curW)*int(curH)*4)
-						texture.Update(nil, unsafe.Pointer(&overlayZero[0]), int(curW)*4)
-					}
-					if yuvTexture != nil {
-						drainPreLock()
-						yuvTexture.Destroy()
-						yuvTexture, err = renderer.CreateTexture(yuvTextureFormat, sdl.TEXTUREACCESS_STREAMING, curW, curH)
-						if err != nil {
-							slog.Warn("IYUV recreate failed after stall reconnect", "err", err)
-							yuvTexture = nil
-							yuvPrimaryPath = false
-						} else if stage := preLockYUV(yuvTexture, int(curW), int(curH), yuvTextureFormat); stage != nil {
-							yuvPrimaryPath = true
-							yuvStageCh <- stage
-						} else {
-							yuvPrimaryPath = false
-						}
-					}
-					yuvReady = false
+					resetAfterReconnect(curW, curH)
 				}
 			}
 		}
