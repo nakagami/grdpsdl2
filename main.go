@@ -20,7 +20,10 @@ import (
 
 const sdlPixelFormatNV12 = uint32(0x3231564E) // SDL_PIXELFORMAT_NV12
 
-func paintImages(bs []grdp.Bitmap, texture *sdl.Texture) {
+// paintImages uploads each bitmap patch into the SDL2 streaming texture.
+// Dirty rects are appended to dirtyRects so the caller can later clear only
+// those regions (instead of the entire texture) when a new H.264 frame arrives.
+func paintImages(bs []grdp.Bitmap, texture *sdl.Texture, dirtyRects *[]sdl.Rect) {
 	for _, bm := range bs {
 		// The texture uses PIXELFORMAT_BGRA32, so grdp's native BGRA data
 		// (BitsPerPixel==4) can be passed directly — no copy or byte-swap needed.
@@ -39,6 +42,7 @@ func paintImages(bs []grdp.Bitmap, texture *sdl.Texture) {
 			}
 			rect := sdl.Rect{X: int32(bm.DestLeft), Y: int32(bm.DestTop), W: int32(w), H: int32(h)}
 			texture.Update(&rect, unsafe.Pointer(&bm.Data[0]), bm.Width*4)
+			*dirtyRects = append(*dirtyRects, rect)
 		} else {
 			// Slow path: convert to RGBA, then swap R↔B for BGRA32 texture.
 			// Use the smaller of the destination rectangle and the actual
@@ -58,6 +62,7 @@ func paintImages(bs []grdp.Bitmap, texture *sdl.Texture) {
 			}
 			rect := sdl.Rect{X: int32(bm.DestLeft), Y: int32(bm.DestTop), W: int32(w), H: int32(h)}
 			texture.Update(&rect, unsafe.Pointer(&img.Pix[0]), img.Stride)
+			*dirtyRects = append(*dirtyRects, rect)
 		}
 	}
 }
@@ -233,6 +238,12 @@ func mainLoop(hostPort, domain, user, password string, width, height int, swap_a
 	yuvReady := false // true once any H264 I420 frame has been rendered
 	clipboardFromServer := make(chan string, 4)
 	clipboardReqCh := make(chan chan string, 1)
+
+	// overlayDirtyRects accumulates the rects painted onto the overlay texture
+	// (non-H264 bitmap updates) since the last H264 frame.  When the next H264
+	// frame arrives we clear only these rects instead of zeroing the entire
+	// screen, cutting GPU texture-upload bandwidth significantly.
+	var overlayDirtyRects []sdl.Rect
 
 	// lastServerActivity tracks the last time we received any data from the
 	// server (bitmap, pointer update, audio, clipboard).  Used by the video
@@ -474,6 +485,12 @@ func mainLoop(hostPort, domain, user, password string, width, height int, swap_a
 
 	for !quit {
 		event := sdl.WaitEventTimeout(8)
+
+		// Coalesce mouse-motion events: only the final position in each tick
+		// is sent to the server, eliminating redundant RDP mouse-move packets.
+		var mouseMoved bool
+		var lastMouseX, lastMouseY int
+
 		for ; event != nil; event = sdl.PollEvent() {
 			switch t := event.(type) {
 			case *sdl.QuitEvent:
@@ -496,7 +513,8 @@ func mainLoop(hostPort, domain, user, password string, width, height int, swap_a
 				}
 
 			case *sdl.MouseMotionEvent:
-				rdpClient.MouseMove(int(t.X), int(t.Y))
+				mouseMoved = true
+				lastMouseX, lastMouseY = int(t.X), int(t.Y)
 
 			case *sdl.MouseButtonEvent:
 				if t.State == sdl.PRESSED {
@@ -510,6 +528,10 @@ func mainLoop(hostPort, domain, user, password string, width, height int, swap_a
 					rdpClient.MouseWheel(int(t.Y))
 				}
 			}
+		}
+
+		if mouseMoved {
+			rdpClient.MouseMove(lastMouseX, lastMouseY)
 		}
 
 		// Drain incoming bitmaps and update GPU texture on the main thread.
@@ -534,7 +556,14 @@ func mainLoop(hostPort, domain, user, password string, width, height int, swap_a
 			}
 		}
 		if haveYUV {
-			texture.Update(nil, unsafe.Pointer(&overlayZero[0]), width*4)
+			// Clear only the rects that were painted onto the overlay since the
+			// last H264 frame.  Zeroing the entire screen on every frame wastes
+			// GPU bandwidth (e.g. 8 MB/frame at 1920×1080); clearing only the
+			// actual dirty regions cuts this to near zero for typical sessions.
+			for i := range overlayDirtyRects {
+				texture.Update(&overlayDirtyRects[i], unsafe.Pointer(&overlayZero[0]), width*4)
+			}
+			overlayDirtyRects = overlayDirtyRects[:0]
 			rect := sdl.Rect{X: int32(latestYUV.destX), Y: int32(latestYUV.destY), W: int32(latestYUV.w), H: int32(latestYUV.h)}
 			if latestYUV.format == sdlPixelFormatNV12 {
 				yuvTexture.UpdateNV(&rect, latestYUV.y, latestYUV.yStride, latestYUV.uv, latestYUV.uvStride)
@@ -550,7 +579,7 @@ func mainLoop(hostPort, domain, user, password string, width, height int, swap_a
 		for {
 			select {
 			case bs := <-bitmapCh:
-				paintImages(bs, texture)
+				paintImages(bs, texture, &overlayDirtyRects)
 				for i := range bs {
 					bitmapBufPool.Put(bs[i].Data)
 				}
@@ -606,6 +635,7 @@ func mainLoop(hostPort, domain, user, password string, width, height int, swap_a
 				slog.Error("Reconnect failed", "err", reconnErr)
 			} else {
 				lastServerActivity.Store(0) // reset watchdog for fresh session
+				overlayDirtyRects = overlayDirtyRects[:0]
 				texture.Destroy()
 				texture, err = renderer.CreateTexture(uint32(sdl.PIXELFORMAT_BGRA32), sdl.TEXTUREACCESS_STREAMING, resizeW, resizeH)
 				if err != nil {
@@ -649,6 +679,7 @@ func mainLoop(hostPort, domain, user, password string, width, height int, swap_a
 					slog.Error("Video stall reconnect failed", "err", reconnErr)
 				} else {
 					lastServerActivity.Store(0) // reset watchdog for fresh session
+					overlayDirtyRects = overlayDirtyRects[:0]
 					texture.Destroy()
 					texture, err = renderer.CreateTexture(uint32(sdl.PIXELFORMAT_BGRA32), sdl.TEXTUREACCESS_STREAMING, curW, curH)
 					if err != nil {
