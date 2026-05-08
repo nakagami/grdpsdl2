@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"net"
 	"os"
+	"runtime"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -16,6 +17,8 @@ import (
 	"github.com/nakagami/grdp/plugin/rdpsnd"
 	"github.com/veandco/go-sdl2/sdl"
 )
+
+const sdlPixelFormatNV12 = uint32(0x3231564E) // SDL_PIXELFORMAT_NV12
 
 func paintImages(bs []grdp.Bitmap, texture *sdl.Texture) {
 	for _, bm := range bs {
@@ -102,18 +105,21 @@ func (a *audioPlayer) close() {
 	}
 }
 
-// yuvFrame carries a decoded H.264 frame in I420 planar format from the grdp
+// yuvFrame carries a decoded H.264 frame in NV12 or I420 format from the grdp
 // callback to the SDL2 main thread.  buf is the single backing allocation that
-// holds all three planes; it is returned to yuvBufPool after the texture upload.
+// holds all planes; it is returned to yuvBufPool after the texture upload.
 type yuvFrame struct {
 	destX, destY, w, h int
+	format             uint32
 	y                  []byte
 	yStride            int
 	u                  []byte
 	uStride            int
 	v                  []byte
 	vStride            int
-	buf                []byte // entire backing store: y||u||v
+	uv                 []byte
+	uvStride           int
+	buf                []byte
 }
 
 func mainLoop(hostPort, domain, user, password string, width, height int, swap_alt_meta bool, keyboardType, keyboardLayout string) (err error) {
@@ -189,16 +195,25 @@ func mainLoop(hostPort, domain, user, password string, width, height int, swap_a
 	defer texture.Destroy()
 	texture.SetBlendMode(sdl.BLENDMODE_BLEND)
 
-	// yuvTexture holds the most recent H264 frame in I420 (IYUV) format.
-	// SDL2's renderer uses hardware YUV→RGB shaders for IYUV textures,
+	// yuvTexture holds the most recent H264 frame as NV12 when supported,
+	// otherwise I420 (IYUV). SDL2's renderer uses hardware YUV→RGB shaders,
 	// offloading colour conversion entirely from the CPU.
 	// On software renderers SDL2 does the conversion in software — no separate
 	// GPU/non-GPU code path is needed.
-	yuvTexture, err := renderer.CreateTexture(uint32(sdl.PIXELFORMAT_IYUV), sdl.TEXTUREACCESS_STREAMING, int32(width), int32(height))
+	yuvTextureFormat := uint32(sdl.PIXELFORMAT_IYUV)
+	if runtime.GOOS == "darwin" {
+		yuvTextureFormat = sdlPixelFormatNV12
+	}
+	yuvTexture, err := renderer.CreateTexture(yuvTextureFormat, sdl.TEXTUREACCESS_STREAMING, int32(width), int32(height))
+	if err != nil && yuvTextureFormat == sdlPixelFormatNV12 {
+		slog.Debug("NV12 texture unsupported, trying IYUV", "err", err)
+		yuvTextureFormat = uint32(sdl.PIXELFORMAT_IYUV)
+		yuvTexture, err = renderer.CreateTexture(yuvTextureFormat, sdl.TEXTUREACCESS_STREAMING, int32(width), int32(height))
+	}
 	if err != nil {
-		// IYUV unsupported (unusual but possible on some drivers); fall back to
-		// BGRA-only rendering by setting yuvTexture to nil.
-		slog.Warn("IYUV texture unsupported, H264 will render via BGRA fallback", "err", err)
+		// YUV unsupported (unusual but possible on some drivers); fall back
+		// to BGRA-only rendering by setting yuvTexture to nil.
+		slog.Warn("YUV texture unsupported, H264 will render via BGRA fallback", "err", err)
 		yuvTexture = nil
 	}
 	if yuvTexture != nil {
@@ -361,48 +376,79 @@ func mainLoop(hostPort, domain, user, password string, width, height int, swap_a
 		}
 	})
 
-	// OnH264I420 receives decoded H264 frames in I420 planar format.
-	// When the SDL2 IYUV texture is available this callback is called instead
-	// of OnBitmap for H264 frames, so the YUV→RGB conversion is done by the
-	// GPU (or SDL2's software renderer) rather than on the CPU.
-	// The plane slices are valid only for the duration of the callback; we
-	// copy them into a pooled buffer and send to yuvCh for the main thread.
 	if yuvTexture != nil {
-		rdpClient.OnH264I420(func(destX, destY, w, h int, y []byte, yStride int, u []byte, uStride int, v []byte, vStride int) {
-			lastServerActivity.Store(time.Now().UnixNano())
-			ph := (h + 1) / 2
-			yLen := yStride * h
-			uLen := uStride * ph
-			vLen := vStride * ph
-			totalLen := yLen + uLen + vLen
-			buf, _ := yuvBufPool.Get().([]byte)
-			if cap(buf) < totalLen {
-				buf = make([]byte, totalLen)
-			} else {
-				buf = buf[:totalLen]
-			}
-			copy(buf[:yLen], y[:yLen])
-			copy(buf[yLen:yLen+uLen], u[:uLen])
-			copy(buf[yLen+uLen:yLen+uLen+vLen], v[:vLen])
-			frame := yuvFrame{
-				destX: destX, destY: destY, w: w, h: h,
-				y: buf[:yLen], yStride: yStride,
-				u: buf[yLen : yLen+uLen], uStride: uStride,
-				v: buf[yLen+uLen : yLen+uLen+vLen], vStride: vStride,
-				buf: buf,
-			}
-			sent := false
-			select {
-			case yuvCh <- frame:
-				sent = true
-			default:
-				yuvBufPool.Put(buf)
-				slog.Warn("yuv channel full, dropping H264 frame")
-			}
-			if sent && bitmapEventType != sdl.FIRSTEVENT {
-				sdl.PushEvent(&sdl.UserEvent{Type: bitmapEventType})
-			}
-		})
+		if yuvTextureFormat == sdlPixelFormatNV12 {
+			rdpClient.OnH264NV12(func(destX, destY, w, h int, y []byte, yStride int, uv []byte, uvStride int) {
+				lastServerActivity.Store(time.Now().UnixNano())
+				ph := (h + 1) / 2
+				yLen := yStride * h
+				uvLen := uvStride * ph
+				totalLen := yLen + uvLen
+				buf, _ := yuvBufPool.Get().([]byte)
+				if cap(buf) < totalLen {
+					buf = make([]byte, totalLen)
+				} else {
+					buf = buf[:totalLen]
+				}
+				copy(buf[:yLen], y[:yLen])
+				copy(buf[yLen:yLen+uvLen], uv[:uvLen])
+				frame := yuvFrame{
+					destX: destX, destY: destY, w: w, h: h,
+					format: yuvTextureFormat,
+					y:      buf[:yLen], yStride: yStride,
+					uv: buf[yLen : yLen+uvLen], uvStride: uvStride,
+					buf: buf,
+				}
+				sent := false
+				select {
+				case yuvCh <- frame:
+					sent = true
+				default:
+					yuvBufPool.Put(buf)
+					slog.Warn("yuv channel full, dropping H264 frame")
+				}
+				if sent && bitmapEventType != sdl.FIRSTEVENT {
+					sdl.PushEvent(&sdl.UserEvent{Type: bitmapEventType})
+				}
+			})
+		} else {
+			rdpClient.OnH264I420(func(destX, destY, w, h int, y []byte, yStride int, u []byte, uStride int, v []byte, vStride int) {
+				lastServerActivity.Store(time.Now().UnixNano())
+				ph := (h + 1) / 2
+				yLen := yStride * h
+				uLen := uStride * ph
+				vLen := vStride * ph
+				totalLen := yLen + uLen + vLen
+				buf, _ := yuvBufPool.Get().([]byte)
+				if cap(buf) < totalLen {
+					buf = make([]byte, totalLen)
+				} else {
+					buf = buf[:totalLen]
+				}
+				copy(buf[:yLen], y[:yLen])
+				copy(buf[yLen:yLen+uLen], u[:uLen])
+				copy(buf[yLen+uLen:yLen+uLen+vLen], v[:vLen])
+				frame := yuvFrame{
+					destX: destX, destY: destY, w: w, h: h,
+					format: yuvTextureFormat,
+					y:      buf[:yLen], yStride: yStride,
+					u: buf[yLen : yLen+uLen], uStride: uStride,
+					v: buf[yLen+uLen : yLen+uLen+vLen], vStride: vStride,
+					buf: buf,
+				}
+				sent := false
+				select {
+				case yuvCh <- frame:
+					sent = true
+				default:
+					yuvBufPool.Put(buf)
+					slog.Warn("yuv channel full, dropping H264 frame")
+				}
+				if sent && bitmapEventType != sdl.FIRSTEVENT {
+					sdl.PushEvent(&sdl.UserEvent{Type: bitmapEventType})
+				}
+			})
+		}
 	}
 
 	// videoStallTimeout is the maximum duration without ANY response from
@@ -469,22 +515,35 @@ func mainLoop(hostPort, domain, user, password string, width, height int, swap_a
 		// Drain incoming bitmaps and update GPU texture on the main thread.
 		dirty := false
 
-		// Drain H264 I420 frames: upload to IYUV texture and clear the overlay
-		// so stale non-H264 patches don't obscure the new baseline frame.
+		// Drain H264 YUV frames. Only the newest frame matters for display, so
+		// discard older queued frames instead of uploading several stale textures
+		// in one event-loop tick.
+		var latestYUV yuvFrame
+		haveYUV := false
 	drainYUV:
 		for {
 			select {
 			case frame := <-yuvCh:
-				// Clear overlay to transparent: the new I420 frame is the fresh baseline.
-				texture.Update(nil, unsafe.Pointer(&overlayZero[0]), width*4)
-				rect := sdl.Rect{X: int32(frame.destX), Y: int32(frame.destY), W: int32(frame.w), H: int32(frame.h)}
-				yuvTexture.UpdateYUV(&rect, frame.y, frame.yStride, frame.u, frame.uStride, frame.v, frame.vStride)
-				yuvBufPool.Put(frame.buf)
-				yuvReady = true
-				dirty = true
+				if haveYUV {
+					yuvBufPool.Put(latestYUV.buf)
+				}
+				latestYUV = frame
+				haveYUV = true
 			default:
 				break drainYUV
 			}
+		}
+		if haveYUV {
+			texture.Update(nil, unsafe.Pointer(&overlayZero[0]), width*4)
+			rect := sdl.Rect{X: int32(latestYUV.destX), Y: int32(latestYUV.destY), W: int32(latestYUV.w), H: int32(latestYUV.h)}
+			if latestYUV.format == sdlPixelFormatNV12 {
+				yuvTexture.UpdateNV(&rect, latestYUV.y, latestYUV.yStride, latestYUV.uv, latestYUV.uvStride)
+			} else {
+				yuvTexture.UpdateYUV(&rect, latestYUV.y, latestYUV.yStride, latestYUV.u, latestYUV.uStride, latestYUV.v, latestYUV.vStride)
+			}
+			yuvBufPool.Put(latestYUV.buf)
+			yuvReady = true
+			dirty = true
 		}
 
 	drain:
@@ -558,7 +617,7 @@ func mainLoop(hostPort, domain, user, password string, width, height int, swap_a
 				}
 				if yuvTexture != nil {
 					yuvTexture.Destroy()
-					yuvTexture, err = renderer.CreateTexture(uint32(sdl.PIXELFORMAT_IYUV), sdl.TEXTUREACCESS_STREAMING, resizeW, resizeH)
+					yuvTexture, err = renderer.CreateTexture(yuvTextureFormat, sdl.TEXTUREACCESS_STREAMING, resizeW, resizeH)
 					if err != nil {
 						slog.Warn("IYUV recreate failed after resize", "err", err)
 						yuvTexture = nil
@@ -601,7 +660,7 @@ func mainLoop(hostPort, domain, user, password string, width, height int, swap_a
 					}
 					if yuvTexture != nil {
 						yuvTexture.Destroy()
-						yuvTexture, err = renderer.CreateTexture(uint32(sdl.PIXELFORMAT_IYUV), sdl.TEXTUREACCESS_STREAMING, curW, curH)
+						yuvTexture, err = renderer.CreateTexture(yuvTextureFormat, sdl.TEXTUREACCESS_STREAMING, curW, curH)
 						if err != nil {
 							slog.Warn("IYUV recreate failed after stall reconnect", "err", err)
 							yuvTexture = nil
