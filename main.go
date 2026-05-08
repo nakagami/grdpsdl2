@@ -67,6 +67,83 @@ func paintImages(bs []grdp.Bitmap, texture *sdl.Texture, dirtyRects *[]sdl.Rect)
 	}
 }
 
+// uploadYUVFrame uploads a decoded H.264 YUV frame into the SDL2 YUV texture.
+//
+// On the SDL2 Metal renderer, SDL_UpdateNVTexture / SDL_UpdateYUVTexture each
+// allocate a separate staging MTLTexture per plane and commit two independent
+// Metal command buffers — a known inefficiency acknowledged by an SDL TODO
+// comment (src/render/metal/SDL_render_metal.m:710-711).
+//
+// SDL_LockTexture on the Metal backend instead allocates a single lightweight
+// MTLBuffer in shared (CPU+GPU unified) memory, lets us write both planes in
+// one Go pass, and uploads everything in a single command-buffer commit on
+// Unlock — halving GPU command overhead per frame.
+//
+// go-sdl2's Lock() computes the returned slice length as pitch×height (Y plane
+// only), omitting the chroma plane.  We extend the slice with unsafe.Slice so
+// we can write into the chroma region that SDL's MTLBuffer actually allocates.
+//
+// If Lock fails (e.g. software renderer fallback) we fall back to UpdateNV /
+// UpdateYUV which are equivalent in correctness.
+func uploadYUVFrame(frame yuvFrame, texture *sdl.Texture, rect *sdl.Rect) {
+	ph := (frame.h + 1) / 2
+
+	if frame.format == sdlPixelFormatNV12 {
+		pixels, pitch, err := texture.Lock(rect)
+		if err != nil {
+			texture.UpdateNV(rect, frame.y, frame.yStride, frame.uv, frame.uvStride)
+			return
+		}
+		defer texture.Unlock()
+		yLen := pitch * frame.h
+		uvLen := pitch * ph
+		// Extend the Y-only slice to cover the full NV12 MTLBuffer (Y + interleaved UV).
+		all := unsafe.Slice(&pixels[0], yLen+uvLen)
+		if pitch == frame.yStride {
+			copy(all[:yLen], frame.y[:yLen])
+			copy(all[yLen:yLen+uvLen], frame.uv[:uvLen])
+		} else {
+			w := frame.w
+			for row := 0; row < frame.h; row++ {
+				copy(all[row*pitch:row*pitch+w], frame.y[row*frame.yStride:])
+			}
+			for row := 0; row < ph; row++ {
+				copy(all[yLen+row*pitch:yLen+row*pitch+w], frame.uv[row*frame.uvStride:])
+			}
+		}
+	} else {
+		// I420 (IYUV): layout is Y | U | V with U/V each at half-width, half-height.
+		pixels, pitch, err := texture.Lock(rect)
+		if err != nil {
+			texture.UpdateYUV(rect, frame.y, frame.yStride, frame.u, frame.uStride, frame.v, frame.vStride)
+			return
+		}
+		defer texture.Unlock()
+		yLen := pitch * frame.h
+		uPitch := (pitch + 1) / 2
+		uvLen := uPitch * ph
+		// Extend slice to cover Y + U + V planes.
+		all := unsafe.Slice(&pixels[0], yLen+uvLen+uvLen)
+		if pitch == frame.yStride && uPitch == frame.uStride {
+			copy(all[:yLen], frame.y[:yLen])
+			copy(all[yLen:yLen+uvLen], frame.u[:uvLen])
+			copy(all[yLen+uvLen:yLen+uvLen+uvLen], frame.v[:uvLen])
+		} else {
+			w := frame.w
+			hw := (frame.w + 1) / 2
+			for row := 0; row < frame.h; row++ {
+				copy(all[row*pitch:row*pitch+w], frame.y[row*frame.yStride:])
+			}
+			for row := 0; row < ph; row++ {
+				copy(all[yLen+row*uPitch:yLen+row*uPitch+hw], frame.u[row*frame.uStride:])
+			}
+			for row := 0; row < ph; row++ {
+				copy(all[yLen+uvLen+row*uPitch:yLen+uvLen+row*uPitch+hw], frame.v[row*frame.vStride:])
+			}
+		}
+	}
+}
+
 // audioPlayer manages SDL2 audio device for RDPSND playback.
 // The device is opened once on the main thread at startup with a fixed format
 // (44100 Hz / stereo / S16LE). play() only calls sdl.QueueAudio which is
@@ -113,6 +190,7 @@ func (a *audioPlayer) close() {
 // yuvFrame carries a decoded H.264 frame in NV12 or I420 format from the grdp
 // callback to the SDL2 main thread.  buf is the single backing allocation that
 // holds all planes; it is returned to yuvBufPool after the texture upload.
+// Used only by the fallback path when pre-locking the YUV texture fails.
 type yuvFrame struct {
 	destX, destY, w, h int
 	format             uint32
@@ -125,6 +203,25 @@ type yuvFrame struct {
 	uv                 []byte
 	uvStride           int
 	buf                []byte
+}
+
+// yuvStage describes the SDL2 YUV texture's pre-locked staging buffer.
+// The main goroutine locks the full texture once and publishes the resulting
+// yuvStage to H.264 callbacks via yuvStageCh, so callbacks can write decoded
+// frames directly into the GPU-accessible unified-memory buffer.
+// This halves per-frame data movement: one copy (grdp → MTLBuffer) instead of
+// two (grdp → pool → MTLBuffer).
+type yuvStage struct {
+	all   []byte // entire locked buffer: Y plane then UV/U/V planes
+	pitch int    // row pitch (bytes) in the locked buffer
+	tw, th int   // full texture dimensions (not the frame sub-rect)
+}
+
+// yuvDone is sent from the H.264 callback goroutine to the main goroutine once
+// the decoded frame has been written into the pre-locked yuvStage, signalling
+// that Unlock (and the resulting Metal command-buffer commit) is safe to call.
+type yuvDone struct {
+	destX, destY, w, h int
 }
 
 func mainLoop(hostPort, domain, user, password string, width, height int, swap_alt_meta bool, keyboardType, keyboardLayout string) (err error) {
@@ -234,10 +331,72 @@ func mainLoop(hostPort, domain, user, password string, width, height int, swap_a
 	texture.Update(nil, unsafe.Pointer(&overlayZero[0]), width*4)
 
 	bitmapCh := make(chan []grdp.Bitmap, 128)
-	yuvCh := make(chan yuvFrame, 128)
-	yuvReady := false // true once any H264 I420 frame has been rendered
+	yuvCh := make(chan yuvFrame, 4) // fallback path only (used when pre-lock unavailable)
+	yuvReady := false               // true once any H264 frame has been rendered
 	clipboardFromServer := make(chan string, 4)
 	clipboardReqCh := make(chan chan string, 1)
+
+	// Pre-lock channels for the primary YUV upload path.
+	// yuvStageCh carries the pre-locked staging buffer from the main goroutine
+	// to H.264 callbacks; yuvDoneCh signals back when a frame has been written.
+	// Capacity 1 each: at most one frame is in flight at any time.
+	yuvStageCh := make(chan *yuvStage, 1)
+	yuvDoneCh := make(chan yuvDone, 1)
+	var yuvWriteWg sync.WaitGroup // counts H.264 writes currently in progress
+
+	// preLockYUV locks the full YUV streaming texture and returns a yuvStage
+	// that H.264 callbacks can write directly into.  Must be called from the
+	// main (SDL) goroutine.  Returns nil if Lock fails (e.g. software renderer).
+	preLockYUV := func(tex *sdl.Texture, tw, th int, format uint32) *yuvStage {
+		pixels, pitch, err := tex.Lock(nil)
+		if err != nil {
+			return nil
+		}
+		ph := (th + 1) / 2
+		var bufLen int
+		if format == sdlPixelFormatNV12 {
+			bufLen = pitch*th + pitch*ph
+		} else {
+			uPitch := (pitch + 1) / 2
+			bufLen = pitch*th + 2*uPitch*ph
+		}
+		return &yuvStage{
+			all:   unsafe.Slice(&pixels[0], bufLen),
+			pitch: pitch,
+			tw:    tw,
+			th:    th,
+		}
+	}
+
+	// drainPreLock ensures yuvTexture is unlocked before destroying or
+	// recreating it.  Waits for any in-progress callback write to finish,
+	// then unlocks if the texture is currently held by the pre-lock path.
+	// Must be called from the main goroutine.
+	drainPreLock := func() {
+		yuvWriteWg.Wait() // wait for any concurrent callback write to finish
+		select {
+		case <-yuvStageCh:
+			yuvTexture.Unlock() // stage was pre-locked but callback never consumed it
+		default:
+			select {
+			case <-yuvDoneCh:
+				yuvTexture.Unlock() // callback wrote a frame; its Unlock was deferred to us
+			default:
+				// texture is not currently locked; nothing to do
+			}
+		}
+	}
+
+	// yuvPrimaryPath is true when the pre-lock optimisation is active.
+	// It is set to false when Lock fails (e.g. software renderer) so
+	// the code automatically degrades to the pool-buffer fallback path.
+	yuvPrimaryPath := false
+	if yuvTexture != nil {
+		if stage := preLockYUV(yuvTexture, width, height, yuvTextureFormat); stage != nil {
+			yuvPrimaryPath = true
+			yuvStageCh <- stage
+		}
+	}
 
 	// overlayDirtyRects accumulates the rects painted onto the overlay texture
 	// (non-H264 bitmap updates) since the last H264 frame.  When the next H264
@@ -391,71 +550,139 @@ func mainLoop(hostPort, domain, user, password string, width, height int, swap_a
 		if yuvTextureFormat == sdlPixelFormatNV12 {
 			rdpClient.OnH264NV12(func(destX, destY, w, h int, y []byte, yStride int, uv []byte, uvStride int) {
 				lastServerActivity.Store(time.Now().UnixNano())
-				ph := (h + 1) / 2
-				yLen := yStride * h
-				uvLen := uvStride * ph
-				totalLen := yLen + uvLen
-				buf, _ := yuvBufPool.Get().([]byte)
-				if cap(buf) < totalLen {
-					buf = make([]byte, totalLen)
+				if yuvPrimaryPath {
+					// Primary path: write grdp data directly into the pre-locked
+					// Metal staging buffer (one copy: grdp → MTLBuffer).
+					select {
+					case stage := <-yuvStageCh:
+						yuvWriteWg.Add(1)
+						defer yuvWriteWg.Done()
+						ph := (h + 1) / 2
+						yLen := stage.pitch * h
+						uvLen := stage.pitch * ph
+						if stage.pitch == yStride {
+							copy(stage.all[:yLen], y[:yLen])
+							copy(stage.all[yLen:yLen+uvLen], uv[:uvLen])
+						} else {
+							for row := 0; row < h; row++ {
+								copy(stage.all[row*stage.pitch:row*stage.pitch+w], y[row*yStride:])
+							}
+							for row := 0; row < ph; row++ {
+								copy(stage.all[yLen+row*stage.pitch:yLen+row*stage.pitch+w], uv[row*uvStride:])
+							}
+						}
+						done := yuvDone{destX: destX, destY: destY, w: w, h: h}
+						select {
+						case yuvDoneCh <- done:
+						default:
+							// Replace stale entry so the main loop always sees the latest frame.
+							<-yuvDoneCh
+							yuvDoneCh <- done
+						}
+					default:
+						slog.Debug("yuv stage not ready, dropping NV12 frame")
+					}
 				} else {
-					buf = buf[:totalLen]
+					// Fallback path (pre-lock unavailable): copy into pool buffer.
+					ph := (h + 1) / 2
+					yLen := yStride * h
+					uvLen := uvStride * ph
+					totalLen := yLen + uvLen
+					buf, _ := yuvBufPool.Get().([]byte)
+					if cap(buf) < totalLen {
+						buf = make([]byte, totalLen)
+					} else {
+						buf = buf[:totalLen]
+					}
+					copy(buf[:yLen], y[:yLen])
+					copy(buf[yLen:yLen+uvLen], uv[:uvLen])
+					frame := yuvFrame{
+						destX: destX, destY: destY, w: w, h: h,
+						format: yuvTextureFormat,
+						y:      buf[:yLen], yStride: yStride,
+						uv:     buf[yLen : yLen+uvLen], uvStride: uvStride,
+						buf:    buf,
+					}
+					select {
+					case yuvCh <- frame:
+					default:
+						yuvBufPool.Put(buf)
+						slog.Warn("yuv channel full, dropping NV12 frame")
+					}
 				}
-				copy(buf[:yLen], y[:yLen])
-				copy(buf[yLen:yLen+uvLen], uv[:uvLen])
-				frame := yuvFrame{
-					destX: destX, destY: destY, w: w, h: h,
-					format: yuvTextureFormat,
-					y:      buf[:yLen], yStride: yStride,
-					uv: buf[yLen : yLen+uvLen], uvStride: uvStride,
-					buf: buf,
-				}
-				sent := false
-				select {
-				case yuvCh <- frame:
-					sent = true
-				default:
-					yuvBufPool.Put(buf)
-					slog.Warn("yuv channel full, dropping H264 frame")
-				}
-				if sent && bitmapEventType != sdl.FIRSTEVENT {
+				if bitmapEventType != sdl.FIRSTEVENT {
 					sdl.PushEvent(&sdl.UserEvent{Type: bitmapEventType})
 				}
 			})
 		} else {
 			rdpClient.OnH264I420(func(destX, destY, w, h int, y []byte, yStride int, u []byte, uStride int, v []byte, vStride int) {
 				lastServerActivity.Store(time.Now().UnixNano())
-				ph := (h + 1) / 2
-				yLen := yStride * h
-				uLen := uStride * ph
-				vLen := vStride * ph
-				totalLen := yLen + uLen + vLen
-				buf, _ := yuvBufPool.Get().([]byte)
-				if cap(buf) < totalLen {
-					buf = make([]byte, totalLen)
+				if yuvPrimaryPath {
+					select {
+					case stage := <-yuvStageCh:
+						yuvWriteWg.Add(1)
+						defer yuvWriteWg.Done()
+						ph := (h + 1) / 2
+						yLen := stage.pitch * h
+						uPitch := (stage.pitch + 1) / 2
+						uvLen := uPitch * ph
+						if stage.pitch == yStride && uPitch == uStride {
+							copy(stage.all[:yLen], y[:yLen])
+							copy(stage.all[yLen:yLen+uvLen], u[:uvLen])
+							copy(stage.all[yLen+uvLen:yLen+uvLen+uvLen], v[:uvLen])
+						} else {
+							w2 := (w + 1) / 2
+							for row := 0; row < h; row++ {
+								copy(stage.all[row*stage.pitch:row*stage.pitch+w], y[row*yStride:])
+							}
+							for row := 0; row < ph; row++ {
+								copy(stage.all[yLen+row*uPitch:yLen+row*uPitch+w2], u[row*uStride:])
+							}
+							for row := 0; row < ph; row++ {
+								copy(stage.all[yLen+uvLen+row*uPitch:yLen+uvLen+row*uPitch+w2], v[row*vStride:])
+							}
+						}
+						done := yuvDone{destX: destX, destY: destY, w: w, h: h}
+						select {
+						case yuvDoneCh <- done:
+						default:
+							<-yuvDoneCh
+							yuvDoneCh <- done
+						}
+					default:
+						slog.Debug("yuv stage not ready, dropping I420 frame")
+					}
 				} else {
-					buf = buf[:totalLen]
+					ph := (h + 1) / 2
+					yLen := yStride * h
+					uLen := uStride * ph
+					vLen := vStride * ph
+					totalLen := yLen + uLen + vLen
+					buf, _ := yuvBufPool.Get().([]byte)
+					if cap(buf) < totalLen {
+						buf = make([]byte, totalLen)
+					} else {
+						buf = buf[:totalLen]
+					}
+					copy(buf[:yLen], y[:yLen])
+					copy(buf[yLen:yLen+uLen], u[:uLen])
+					copy(buf[yLen+uLen:yLen+uLen+vLen], v[:vLen])
+					frame := yuvFrame{
+						destX: destX, destY: destY, w: w, h: h,
+						format: yuvTextureFormat,
+						y:      buf[:yLen], yStride: yStride,
+						u:      buf[yLen : yLen+uLen], uStride: uStride,
+						v:      buf[yLen+uLen : yLen+uLen+vLen], vStride: vStride,
+						buf:    buf,
+					}
+					select {
+					case yuvCh <- frame:
+					default:
+						yuvBufPool.Put(buf)
+						slog.Warn("yuv channel full, dropping I420 frame")
+					}
 				}
-				copy(buf[:yLen], y[:yLen])
-				copy(buf[yLen:yLen+uLen], u[:uLen])
-				copy(buf[yLen+uLen:yLen+uLen+vLen], v[:vLen])
-				frame := yuvFrame{
-					destX: destX, destY: destY, w: w, h: h,
-					format: yuvTextureFormat,
-					y:      buf[:yLen], yStride: yStride,
-					u: buf[yLen : yLen+uLen], uStride: uStride,
-					v: buf[yLen+uLen : yLen+uLen+vLen], vStride: vStride,
-					buf: buf,
-				}
-				sent := false
-				select {
-				case yuvCh <- frame:
-					sent = true
-				default:
-					yuvBufPool.Put(buf)
-					slog.Warn("yuv channel full, dropping H264 frame")
-				}
-				if sent && bitmapEventType != sdl.FIRSTEVENT {
+				if bitmapEventType != sdl.FIRSTEVENT {
 					sdl.PushEvent(&sdl.UserEvent{Type: bitmapEventType})
 				}
 			})
@@ -537,42 +764,65 @@ func mainLoop(hostPort, domain, user, password string, width, height int, swap_a
 		// Drain incoming bitmaps and update GPU texture on the main thread.
 		dirty := false
 
-		// Drain H264 YUV frames. Only the newest frame matters for display, so
-		// discard older queued frames instead of uploading several stale textures
-		// in one event-loop tick.
-		var latestYUV yuvFrame
-		haveYUV := false
-	drainYUV:
-		for {
+		// Process H.264 YUV frames.
+		if yuvPrimaryPath {
+			// Primary path: the callback wrote directly into the pre-locked Metal
+			// staging buffer.  We just need to Unlock (which commits one Metal
+			// command buffer to blit the buffer into the YUV texture) and
+			// immediately re-lock so the staging buffer is ready for the next frame.
 			select {
-			case frame := <-yuvCh:
-				if haveYUV {
-					yuvBufPool.Put(latestYUV.buf)
+			case done := <-yuvDoneCh:
+				for i := range overlayDirtyRects {
+					texture.Update(&overlayDirtyRects[i], unsafe.Pointer(&overlayZero[0]), width*4)
 				}
-				latestYUV = frame
-				haveYUV = true
+				overlayDirtyRects = overlayDirtyRects[:0]
+				yuvTexture.Unlock() // GPU upload: grdp → MTLBuffer already done by callback
+				// Re-lock immediately so the next callback can write without waiting.
+				if stage := preLockYUV(yuvTexture, width, height, yuvTextureFormat); stage != nil {
+					select {
+					case yuvStageCh <- stage:
+					default:
+						// Channel already has a stage (shouldn't happen); release this one.
+						yuvTexture.Unlock()
+					}
+				} else {
+					slog.Warn("YUV pre-lock failed after frame, switching to fallback path")
+					yuvPrimaryPath = false
+				}
+				_ = done // destX/destY not needed; we locked the full texture
+				yuvReady = true
+				dirty = true
 			default:
-				break drainYUV
 			}
-		}
-		if haveYUV {
-			// Clear only the rects that were painted onto the overlay since the
-			// last H264 frame.  Zeroing the entire screen on every frame wastes
-			// GPU bandwidth (e.g. 8 MB/frame at 1920×1080); clearing only the
-			// actual dirty regions cuts this to near zero for typical sessions.
-			for i := range overlayDirtyRects {
-				texture.Update(&overlayDirtyRects[i], unsafe.Pointer(&overlayZero[0]), width*4)
+		} else {
+			// Fallback path: drain pool-buffer frames copied by the callback and
+			// upload them with the Lock/copy/Unlock path (two copies total).
+			var latestYUV yuvFrame
+			haveYUV := false
+		drainYUV:
+			for {
+				select {
+				case frame := <-yuvCh:
+					if haveYUV {
+						yuvBufPool.Put(latestYUV.buf)
+					}
+					latestYUV = frame
+					haveYUV = true
+				default:
+					break drainYUV
+				}
 			}
-			overlayDirtyRects = overlayDirtyRects[:0]
-			rect := sdl.Rect{X: int32(latestYUV.destX), Y: int32(latestYUV.destY), W: int32(latestYUV.w), H: int32(latestYUV.h)}
-			if latestYUV.format == sdlPixelFormatNV12 {
-				yuvTexture.UpdateNV(&rect, latestYUV.y, latestYUV.yStride, latestYUV.uv, latestYUV.uvStride)
-			} else {
-				yuvTexture.UpdateYUV(&rect, latestYUV.y, latestYUV.yStride, latestYUV.u, latestYUV.uStride, latestYUV.v, latestYUV.vStride)
+			if haveYUV {
+				for i := range overlayDirtyRects {
+					texture.Update(&overlayDirtyRects[i], unsafe.Pointer(&overlayZero[0]), width*4)
+				}
+				overlayDirtyRects = overlayDirtyRects[:0]
+				rect := sdl.Rect{X: int32(latestYUV.destX), Y: int32(latestYUV.destY), W: int32(latestYUV.w), H: int32(latestYUV.h)}
+				uploadYUVFrame(latestYUV, yuvTexture, &rect)
+				yuvBufPool.Put(latestYUV.buf)
+				yuvReady = true
+				dirty = true
 			}
-			yuvBufPool.Put(latestYUV.buf)
-			yuvReady = true
-			dirty = true
 		}
 
 	drain:
@@ -646,11 +896,18 @@ func mainLoop(hostPort, domain, user, password string, width, height int, swap_a
 					texture.Update(nil, unsafe.Pointer(&overlayZero[0]), int(resizeW)*4)
 				}
 				if yuvTexture != nil {
+					drainPreLock()
 					yuvTexture.Destroy()
 					yuvTexture, err = renderer.CreateTexture(yuvTextureFormat, sdl.TEXTUREACCESS_STREAMING, resizeW, resizeH)
 					if err != nil {
 						slog.Warn("IYUV recreate failed after resize", "err", err)
 						yuvTexture = nil
+						yuvPrimaryPath = false
+					} else if stage := preLockYUV(yuvTexture, int(resizeW), int(resizeH), yuvTextureFormat); stage != nil {
+						yuvPrimaryPath = true
+						yuvStageCh <- stage
+					} else {
+						yuvPrimaryPath = false
 					}
 				}
 				yuvReady = false
@@ -690,11 +947,18 @@ func mainLoop(hostPort, domain, user, password string, width, height int, swap_a
 						texture.Update(nil, unsafe.Pointer(&overlayZero[0]), int(curW)*4)
 					}
 					if yuvTexture != nil {
+						drainPreLock()
 						yuvTexture.Destroy()
 						yuvTexture, err = renderer.CreateTexture(yuvTextureFormat, sdl.TEXTUREACCESS_STREAMING, curW, curH)
 						if err != nil {
 							slog.Warn("IYUV recreate failed after stall reconnect", "err", err)
 							yuvTexture = nil
+							yuvPrimaryPath = false
+						} else if stage := preLockYUV(yuvTexture, int(curW), int(curH), yuvTextureFormat); stage != nil {
+							yuvPrimaryPath = true
+							yuvStageCh <- stage
+						} else {
+							yuvPrimaryPath = false
 						}
 					}
 					yuvReady = false
