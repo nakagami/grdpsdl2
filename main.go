@@ -584,17 +584,23 @@ func mainLoop(hostPort, domain, user, password string, width, height int, swap_a
 						yuvWriteWg.Add(1)
 						defer yuvWriteWg.Done()
 						ph := (h + 1) / 2
-						yLen := stage.pitch * h
+						// UV plane starts after ALL Y rows of the full texture,
+						// not just the frame rows.  Using stage.th (texture height)
+						// instead of h fixes corruption when the frame is smaller
+						// than the texture (e.g. a video window inside the desktop).
+						yBaseLen := stage.pitch * stage.th
 						uvLen := stage.pitch * ph
-						if stage.pitch == yStride {
-							copy(stage.all[:yLen], y[:yLen])
-							copy(stage.all[yLen:yLen+uvLen], uv[:uvLen])
+						if stage.pitch == yStride && destX == 0 && destY == 0 {
+							copy(stage.all[:stage.pitch*h], y[:stage.pitch*h])
+							copy(stage.all[yBaseLen:yBaseLen+uvLen], uv[:uvLen])
 						} else {
 							for row := 0; row < h; row++ {
-								copy(stage.all[row*stage.pitch:row*stage.pitch+w], y[row*yStride:])
+								dstOff := (destY+row)*stage.pitch + destX
+								copy(stage.all[dstOff:dstOff+w], y[row*yStride:row*yStride+w])
 							}
 							for row := 0; row < ph; row++ {
-								copy(stage.all[yLen+row*stage.pitch:yLen+row*stage.pitch+w], uv[row*uvStride:])
+								dstOff := yBaseLen + (destY/2+row)*stage.pitch + destX
+								copy(stage.all[dstOff:dstOff+w], uv[row*uvStride:row*uvStride+w])
 							}
 						}
 						done := yuvDone{destX: destX, destY: destY, w: w, h: h}
@@ -649,23 +655,32 @@ func mainLoop(hostPort, domain, user, password string, width, height int, swap_a
 						yuvWriteWg.Add(1)
 						defer yuvWriteWg.Done()
 						ph := (h + 1) / 2
-						yLen := stage.pitch * h
+						// UV planes start after ALL Y rows of the full texture.
+						// Using stage.th (texture height) instead of h fixes
+						// corruption when the frame is smaller than the texture.
+						yBaseLen := stage.pitch * stage.th
 						uPitch := (stage.pitch + 1) / 2
+						ph_tex := (stage.th + 1) / 2
 						uvLen := uPitch * ph
-						if stage.pitch == yStride && uPitch == uStride {
-							copy(stage.all[:yLen], y[:yLen])
-							copy(stage.all[yLen:yLen+uvLen], u[:uvLen])
-							copy(stage.all[yLen+uvLen:yLen+uvLen+uvLen], v[:uvLen])
+						uBaseLen := yBaseLen + uPitch*ph_tex
+						vBaseLen := uBaseLen + uPitch*ph_tex
+						if stage.pitch == yStride && uPitch == uStride && destX == 0 && destY == 0 {
+							copy(stage.all[:stage.pitch*h], y[:stage.pitch*h])
+							copy(stage.all[uBaseLen:uBaseLen+uvLen], u[:uvLen])
+							copy(stage.all[vBaseLen:vBaseLen+uvLen], v[:uvLen])
 						} else {
 							w2 := (w + 1) / 2
 							for row := 0; row < h; row++ {
-								copy(stage.all[row*stage.pitch:row*stage.pitch+w], y[row*yStride:])
+								dstOff := (destY+row)*stage.pitch + destX
+								copy(stage.all[dstOff:dstOff+w], y[row*yStride:row*yStride+w])
 							}
 							for row := 0; row < ph; row++ {
-								copy(stage.all[yLen+row*uPitch:yLen+row*uPitch+w2], u[row*uStride:])
+								dstOff := uBaseLen + (destY/2+row)*uPitch + destX/2
+								copy(stage.all[dstOff:dstOff+w2], u[row*uStride:row*uStride+w2])
 							}
 							for row := 0; row < ph; row++ {
-								copy(stage.all[yLen+uvLen+row*uPitch:yLen+uvLen+row*uPitch+w2], v[row*vStride:])
+								dstOff := vBaseLen + (destY/2+row)*uPitch + destX/2
+								copy(stage.all[dstOff:dstOff+w2], v[row*vStride:row*vStride+w2])
 							}
 						}
 						done := yuvDone{destX: destX, destY: destY, w: w, h: h}
