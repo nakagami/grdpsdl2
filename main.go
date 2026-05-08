@@ -352,7 +352,7 @@ func mainLoop(hostPort, domain, user, password string, width, height int, swap_a
 	// Initialise texture to transparent now so blending is correct from the first frame.
 	texture.Update(nil, unsafe.Pointer(&overlayZero[0]), width*4)
 
-	bitmapCh := make(chan []grdp.Bitmap, 128)
+	bitmapCh := make(chan []grdp.Bitmap, 32)
 	yuvCh := make(chan yuvFrame, 4) // fallback path only (used when pre-lock unavailable)
 	yuvReady := false               // true once any H264 frame has been rendered
 	clipboardFromServer := make(chan string, 4)
@@ -427,6 +427,25 @@ func mainLoop(hostPort, domain, user, password string, width, height int, swap_a
 	// Pre-allocated with capacity 64 to avoid append reallocation on typical frames.
 	overlayDirtyRects := make([]sdl.Rect, 0, 64)
 
+	// clearOverlayDirty clears the overlay texture regions accumulated in
+	// overlayDirtyRects and resets the slice.  When the number of dirty rects
+	// exceeds a threshold, a single full-texture update is cheaper than many
+	// individual SDL_UpdateTexture calls (each incurring a separate GPU blit).
+	clearOverlayDirty := func() {
+		if len(overlayDirtyRects) == 0 {
+			return
+		}
+		if len(overlayDirtyRects) > 8 {
+			// Batch path: one GPU upload clears the entire overlay texture.
+			texture.Update(nil, unsafe.Pointer(&overlayZero[0]), width*4)
+		} else {
+			for i := range overlayDirtyRects {
+				texture.Update(&overlayDirtyRects[i], unsafe.Pointer(&overlayZero[0]), width*4)
+			}
+		}
+		overlayDirtyRects = overlayDirtyRects[:0]
+	}
+
 	// lastServerActivity tracks the last time we received any data from the
 	// server (bitmap, pointer update, audio, clipboard).  Used by the video
 	// stall watchdog below to distinguish a truly stuck stream from an idle
@@ -442,7 +461,22 @@ func mainLoop(hostPort, domain, user, password string, width, height int, swap_a
 		dialer := &net.Dialer{
 			KeepAlive: 300 * time.Second,
 		}
-		return dialer.Dial("tcp", hostPort)
+		conn, err := dialer.Dial("tcp", hostPort)
+		if err != nil {
+			return nil, err
+		}
+		if tc, ok := conn.(*net.TCPConn); ok {
+			// Disable Nagle's algorithm so keyboard/mouse packets are sent
+			// immediately without waiting for more data to accumulate
+			// (up to ~40 ms delay otherwise).
+			tc.SetNoDelay(true)
+			// Increase the TCP receive buffer to 4 MB.  RDP H.264 I-frames can
+			// be several hundred KB; a large buffer lets the OS accept a burst
+			// without shrinking the receive window and throttling the server,
+			// reducing the gap between frames during screen animations.
+			tc.SetReadBuffer(4 * 1024 * 1024)
+		}
+		return conn, nil
 	})
 	if keyboardType != "" {
 		rdpClient.SetKeyboardType(keyboardType)
@@ -849,10 +883,7 @@ func mainLoop(hostPort, domain, user, password string, width, height int, swap_a
 			// immediately re-lock so the staging buffer is ready for the next frame.
 			select {
 			case done := <-yuvDoneCh:
-				for i := range overlayDirtyRects {
-					texture.Update(&overlayDirtyRects[i], unsafe.Pointer(&overlayZero[0]), width*4)
-				}
-				overlayDirtyRects = overlayDirtyRects[:0]
+				clearOverlayDirty()
 				yuvTexture.Unlock() // GPU upload: grdp → MTLBuffer already done by callback
 				// Re-lock immediately so the next callback can write without waiting.
 				if stage := preLockYUV(yuvTexture, width, height, yuvTextureFormat); stage != nil {
@@ -890,10 +921,7 @@ func mainLoop(hostPort, domain, user, password string, width, height int, swap_a
 				}
 			}
 			if haveYUV {
-				for i := range overlayDirtyRects {
-					texture.Update(&overlayDirtyRects[i], unsafe.Pointer(&overlayZero[0]), width*4)
-				}
-				overlayDirtyRects = overlayDirtyRects[:0]
+				clearOverlayDirty()
 				rect := sdl.Rect{X: int32(latestYUV.destX), Y: int32(latestYUV.destY), W: int32(latestYUV.w), H: int32(latestYUV.h)}
 				uploadYUVFrame(latestYUV, yuvTexture, &rect)
 				yuvBufPool.Put(latestYUV.buf)
