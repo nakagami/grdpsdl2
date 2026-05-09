@@ -324,6 +324,7 @@ type yuvStage struct {
 type yuvDone struct {
 	destX, destY, w, h int
 	isNull             bool // true when the decoded frame is all-zero (VideoToolbox flush/init artifact)
+	fullTexture        bool // true when the frame covered the full texture; UV is fully written — skip chroma init on next lock
 }
 
 // isNullYUVFrame samples 8 evenly-spaced values from each of the Y and chroma
@@ -783,9 +784,13 @@ func mainLoop(hostPort, domain, user, password string, width, height int, swap_a
 				if yuvPrimaryPath {
 					// Primary path: write grdp data directly into the pre-locked
 					// Metal staging buffer (one copy: grdp → MTLBuffer).
+					//
+					// Add to WaitGroup BEFORE the select so drainPreLock's Wait()
+					// cannot return between the stage receive and the first write,
+					// eliminating a narrow use-after-free window during reconnect.
+					yuvWriteWg.Add(1)
 					select {
 					case stage := <-yuvStageCh:
-						yuvWriteWg.Add(1)
 						defer yuvWriteWg.Done()
 						ph := (h + 1) / 2
 						// UV plane starts after ALL Y rows of the full texture,
@@ -795,6 +800,10 @@ func mainLoop(hostPort, domain, user, password string, width, height int, swap_a
 						yBaseLen := stage.pitch * stage.th
 						uvLen := stage.pitch * ph
 						fastPath := stage.pitch == yStride && destX == 0 && destY == 0
+						// fullTexture: the frame covers the entire texture, so every
+						// Y and UV byte will be overwritten — the next lock can skip
+						// the UV pre-initialisation (saves ~1 MB memset per frame).
+						fullTexture := fastPath && h == stage.th
 						if fastPath {
 							copy(stage.all[:stage.pitch*h], y[:stage.pitch*h])
 							copy(stage.all[yBaseLen:yBaseLen+uvLen], uv[:uvLen])
@@ -808,7 +817,8 @@ func mainLoop(hostPort, domain, user, password string, width, height int, swap_a
 								copy(stage.all[dstOff:dstOff+w], uv[row*uvStride:row*uvStride+w])
 							}
 						}
-						done := yuvDone{destX: destX, destY: destY, w: w, h: h, isNull: isNullYUVFrame(y, uv)}
+						done := yuvDone{destX: destX, destY: destY, w: w, h: h,
+							isNull: isNullYUVFrame(y, uv), fullTexture: fullTexture}
 						select {
 						case yuvDoneCh <- done:
 						default:
@@ -817,6 +827,7 @@ func mainLoop(hostPort, domain, user, password string, width, height int, swap_a
 							yuvDoneCh <- done
 						}
 					default:
+						yuvWriteWg.Done()
 						slog.Debug("yuv stage not ready, dropping NV12 frame")
 					}
 				} else {
@@ -856,9 +867,10 @@ func mainLoop(hostPort, domain, user, password string, width, height int, swap_a
 			rdpClient.OnH264I420(func(destX, destY, w, h int, y []byte, yStride int, u []byte, uStride int, v []byte, vStride int) {
 				lastServerActivity.Store(time.Now().UnixNano())
 				if yuvPrimaryPath {
+					// Add to WaitGroup BEFORE the select (same rationale as NV12 path).
+					yuvWriteWg.Add(1)
 					select {
 					case stage := <-yuvStageCh:
-						yuvWriteWg.Add(1)
 						defer yuvWriteWg.Done()
 						ph := (h + 1) / 2
 						// UV planes start after ALL Y rows of the full texture.
@@ -871,6 +883,7 @@ func mainLoop(hostPort, domain, user, password string, width, height int, swap_a
 						uBaseLen := yBaseLen + uPitch*ph_tex
 						vBaseLen := uBaseLen + uPitch*ph_tex
 						fastPath := stage.pitch == yStride && uPitch == uStride && destX == 0 && destY == 0
+						fullTexture := fastPath && h == stage.th
 						if fastPath {
 							copy(stage.all[:stage.pitch*h], y[:stage.pitch*h])
 							copy(stage.all[uBaseLen:uBaseLen+uvLen], u[:uvLen])
@@ -890,7 +903,8 @@ func mainLoop(hostPort, domain, user, password string, width, height int, swap_a
 								copy(stage.all[dstOff:dstOff+w2], v[row*vStride:row*vStride+w2])
 							}
 						}
-						done := yuvDone{destX: destX, destY: destY, w: w, h: h, isNull: isNullYUVFrame(y, u)}
+						done := yuvDone{destX: destX, destY: destY, w: w, h: h,
+							isNull: isNullYUVFrame(y, u), fullTexture: fullTexture}
 						select {
 						case yuvDoneCh <- done:
 						default:
@@ -898,6 +912,7 @@ func mainLoop(hostPort, domain, user, password string, width, height int, swap_a
 							yuvDoneCh <- done
 						}
 					default:
+						yuvWriteWg.Done()
 						slog.Debug("yuv stage not ready, dropping I420 frame")
 					}
 				} else {
@@ -1075,12 +1090,17 @@ func mainLoop(hostPort, domain, user, password string, width, height int, swap_a
 					initYUVBlack(yuvTexture, width, height, yuvTextureFormat)
 				}
 				// Re-lock immediately so the next callback can write without waiting.
-				// Always initialise chroma to 128 (neutral) on every re-lock:
-				// Metal's staging MTLBuffer pool may hand us a freshly zeroed buffer,
-				// and a partial-frame update will only overwrite the changed region.
-				// Unwritten UV=0 bytes would render green (Y=0,UV=0 ≈ RGB(0,136,0)
-				// in BT.601), causing a thin green flicker over the image.
-				if stage := preLockYUV(yuvTexture, width, height, yuvTextureFormat, true); stage != nil {
+				// Skip UV pre-initialisation when the last frame was full-texture:
+				// every UV byte was already overwritten by the callback, so Metal's
+				// staging buffer (even if freshly zeroed by the pool) has correct 4:2:0
+				// chroma.  For partial frames the init is still required to avoid green
+				// fringes (UV=0 ≈ RGB(0,136,0) in BT.601) in unwritten regions.
+				// After a null frame, always reinit (null frames write Y=0,UV=0).
+				// Skip UV pre-initialisation when the current frame already wrote
+				// every UV byte (full-texture fast path).  Always reinit after a
+				// null frame (VideoToolbox flush: Y=0,UV=0 bytes were written).
+				needsChromaInit := !done.fullTexture || done.isNull
+				if stage := preLockYUV(yuvTexture, width, height, yuvTextureFormat, needsChromaInit); stage != nil {
 					select {
 					case yuvStageCh <- stage:
 					default:
