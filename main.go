@@ -227,7 +227,6 @@ type yuvStage struct {
 type yuvDone struct {
 	destX, destY, w, h int
 	isNull             bool // true when the decoded frame is all-zero (VideoToolbox flush/init artifact)
-	fullFrame          bool // true when every UV byte was overwritten (full-texture fast path)
 }
 
 // isNullYUVFrame samples 8 evenly-spaced values from each of the Y and chroma
@@ -423,11 +422,10 @@ func mainLoop(hostPort, domain, user, password string, width, height int, swap_a
 	// preLockYUV locks the full YUV streaming texture and returns a yuvStage
 	// that H.264 callbacks can write directly into.  Must be called from the
 	// main (SDL) goroutine.  Returns nil if Lock fails (e.g. software renderer).
-	// initChroma should be true on the first lock and after any reconnect so
-	// that unwritten chroma regions show black (neutral 128) instead of green.
-	// After a full-frame H.264 write (destX=0, destY=0, w=tw, h=th) the
-	// decoder overwrites every chroma byte, so initChroma can be false —
-	// saving ~1 MB of memset at 60fps.
+	// initChroma should be true so that unwritten chroma regions render black
+	// (neutral 128) instead of green (Y=0,UV=0 is not a valid black in BT.601).
+	// Metal's staging MTLBuffer pool may return a freshly zeroed buffer on each
+	// lock, so we cannot rely on previous-frame data in unwritten UV regions.
 	preLockYUV := func(tex *sdl.Texture, tw, th int, format uint32, initChroma bool) *yuvStage {
 		pixels, pitch, err := tex.Lock(nil)
 		if err != nil {
@@ -700,7 +698,6 @@ func mainLoop(hostPort, domain, user, password string, width, height int, swap_a
 						yBaseLen := stage.pitch * stage.th
 						uvLen := stage.pitch * ph
 						fastPath := stage.pitch == yStride && destX == 0 && destY == 0
-						fullFrame := fastPath && h == stage.th
 						if fastPath {
 							copy(stage.all[:stage.pitch*h], y[:stage.pitch*h])
 							copy(stage.all[yBaseLen:yBaseLen+uvLen], uv[:uvLen])
@@ -714,8 +711,7 @@ func mainLoop(hostPort, domain, user, password string, width, height int, swap_a
 								copy(stage.all[dstOff:dstOff+w], uv[row*uvStride:row*uvStride+w])
 							}
 						}
-						done := yuvDone{destX: destX, destY: destY, w: w, h: h, isNull: isNullYUVFrame(y, uv),
-							fullFrame: fullFrame}
+						done := yuvDone{destX: destX, destY: destY, w: w, h: h, isNull: isNullYUVFrame(y, uv)}
 						select {
 						case yuvDoneCh <- done:
 						default:
@@ -777,7 +773,6 @@ func mainLoop(hostPort, domain, user, password string, width, height int, swap_a
 						uBaseLen := yBaseLen + uPitch*ph_tex
 						vBaseLen := uBaseLen + uPitch*ph_tex
 						fastPath := stage.pitch == yStride && uPitch == uStride && destX == 0 && destY == 0
-						fullFrame := fastPath && h == stage.th
 						if fastPath {
 							copy(stage.all[:stage.pitch*h], y[:stage.pitch*h])
 							copy(stage.all[uBaseLen:uBaseLen+uvLen], u[:uvLen])
@@ -797,8 +792,7 @@ func mainLoop(hostPort, domain, user, password string, width, height int, swap_a
 								copy(stage.all[dstOff:dstOff+w2], v[row*vStride:row*vStride+w2])
 							}
 						}
-						done := yuvDone{destX: destX, destY: destY, w: w, h: h, isNull: isNullYUVFrame(y, u),
-							fullFrame: fullFrame}
+						done := yuvDone{destX: destX, destY: destY, w: w, h: h, isNull: isNullYUVFrame(y, u)}
 						select {
 						case yuvDoneCh <- done:
 						default:
@@ -974,12 +968,12 @@ func mainLoop(hostPort, domain, user, password string, width, height int, swap_a
 				clearOverlayDirty()
 				yuvTexture.Unlock() // GPU upload: grdp → MTLBuffer already done by callback
 				// Re-lock immediately so the next callback can write without waiting.
-				// initChroma sets unwritten UV bytes to 128 (neutral chroma) so they
-				// render black instead of green (Y=0,UV=0 ≈ RGB(0,136,0) in BT.601).
-				// Skip the ~1 MB memset when the previous frame was full-screen: in
-				// that case every UV byte was overwritten by the callback, so stale
-				// pool-buffer bytes are all legitimate frame content, not zeros.
-				if stage := preLockYUV(yuvTexture, width, height, yuvTextureFormat, !done.fullFrame); stage != nil {
+				// Always initialise chroma to 128 (neutral) on every re-lock:
+				// Metal's staging MTLBuffer pool may hand us a freshly zeroed buffer,
+				// and a partial-frame update will only overwrite the changed region.
+				// Unwritten UV=0 bytes would render green (Y=0,UV=0 ≈ RGB(0,136,0)
+				// in BT.601), causing a thin green flicker over the image.
+				if stage := preLockYUV(yuvTexture, width, height, yuvTextureFormat, true); stage != nil {
 					select {
 					case yuvStageCh <- stage:
 					default:
