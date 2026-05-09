@@ -947,12 +947,12 @@ func mainLoop(hostPort, domain, user, password string, width, height int, swap_a
 				}
 
 			case *sdl.MouseWheelEvent:
-				dy := int(t.PreciseY)
+				dy := t.PreciseY
 				if t.Direction == sdl.MOUSEWHEEL_FLIPPED {
 					dy = -dy
 				}
 				if dy != 0 {
-					rdpClient.MouseWheel(dy)
+					rdpClient.MouseWheel(float64(dy))
 				}
 			}
 		}
