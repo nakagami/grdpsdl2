@@ -37,14 +37,8 @@ func paintImages(bs []grdp.Bitmap, texture *sdl.Texture, dirtyRects *[]sdl.Rect)
 		// are uncommon outside of traditional RDP bitmap updates.
 		if bm.BitsPerPixel == 4 {
 			// Fast path: BGRA data passes straight to the BGRA32 texture.
-			w := bm.DestRight - bm.DestLeft + 1
-			if w > bm.Width {
-				w = bm.Width
-			}
-			h := bm.DestBottom - bm.DestTop + 1
-			if h > bm.Height {
-				h = bm.Height
-			}
+			w := min(bm.DestRight-bm.DestLeft+1, bm.Width)
+			h := min(bm.DestBottom-bm.DestTop+1, bm.Height)
 			rect := sdl.Rect{X: int32(bm.DestLeft), Y: int32(bm.DestTop), W: int32(w), H: int32(h)}
 			texture.Update(&rect, unsafe.Pointer(&bm.Data[0]), bm.Width*4)
 			*dirtyRects = append(*dirtyRects, rect)
@@ -112,7 +106,7 @@ func uploadYUVFrame(frame yuvFrame, texture *sdl.Texture, rect *sdl.Rect) {
 			for row := 0; row < frame.h; row++ {
 				copy(all[row*pitch:row*pitch+w], frame.y[row*frame.yStride:])
 			}
-			for row := 0; row < ph; row++ {
+			for row := range ph {
 				copy(all[yLen+row*pitch:yLen+row*pitch+w], frame.uv[row*frame.uvStride:])
 			}
 		}
@@ -139,10 +133,10 @@ func uploadYUVFrame(frame yuvFrame, texture *sdl.Texture, rect *sdl.Rect) {
 			for row := 0; row < frame.h; row++ {
 				copy(all[row*pitch:row*pitch+w], frame.y[row*frame.yStride:])
 			}
-			for row := 0; row < ph; row++ {
+			for row := range ph {
 				copy(all[yLen+row*uPitch:yLen+row*uPitch+hw], frame.u[row*frame.uStride:])
 			}
-			for row := 0; row < ph; row++ {
+			for row := range ph {
 				copy(all[yLen+uvLen+row*uPitch:yLen+uvLen+row*uPitch+hw], frame.v[row*frame.vStride:])
 			}
 		}
@@ -228,9 +222,9 @@ type yuvFrame struct {
 // This halves per-frame data movement: one copy (grdp → MTLBuffer) instead of
 // two (grdp → pool → MTLBuffer).
 type yuvStage struct {
-	all   []byte // entire locked buffer: Y plane then UV/U/V planes
-	pitch int    // row pitch (bytes) in the locked buffer
-	tw, th int   // full texture dimensions (not the frame sub-rect)
+	all    []byte // entire locked buffer: Y plane then UV/U/V planes
+	pitch  int    // row pitch (bytes) in the locked buffer
+	tw, th int    // full texture dimensions (not the frame sub-rect)
 }
 
 // yuvDone is sent from the H.264 callback goroutine to the main goroutine once
@@ -238,8 +232,8 @@ type yuvStage struct {
 // that Unlock (and the resulting Metal command-buffer commit) is safe to call.
 type yuvDone struct {
 	destX, destY, w, h int
-	isNull              bool // true when the decoded frame is all-zero (VideoToolbox flush/init artifact)
-	fullFrame           bool // true when every UV byte was overwritten (full-texture fast path)
+	isNull             bool // true when the decoded frame is all-zero (VideoToolbox flush/init artifact)
+	fullFrame          bool // true when every UV byte was overwritten (full-texture fast path)
 }
 
 // isNullYUVFrame samples 8 evenly-spaced values from each of the Y and chroma
@@ -388,10 +382,10 @@ func mainLoop(hostPort, domain, user, password string, width, height int, swap_a
 	// instead of green.  (Uninitialized NV12/IYUV bytes are typically all-zero;
 	// Y=0,U=0,V=0 maps to RGB≈(0,136,0) — the momentary green flash.)
 	initYUVBlack := func(tex *sdl.Texture, w, h int, format uint32) {
-		yBuf := make([]byte, w*h)          // Y=0 (full-range black luma)
+		yBuf := make([]byte, w*h) // Y=0 (full-range black luma)
 		ph := (h + 1) / 2
 		if format == sdlPixelFormatNV12 {
-			uvBuf := make([]byte, w*ph)    // interleaved UV; 128 = neutral chroma
+			uvBuf := make([]byte, w*ph) // interleaved UV; 128 = neutral chroma
 			for i := range uvBuf {
 				uvBuf[i] = 128
 			}
@@ -656,7 +650,7 @@ func mainLoop(hostPort, domain, user, password string, width, height int, swap_a
 		if bpp == 24 {
 			n := len(data) / 3
 			rgba := make([]byte, n*4)
-			for i := 0; i < n; i++ {
+			for i := range n {
 				b, g, r := data[3*i], data[3*i+1], data[3*i+2]
 				// Branchless alpha: 0x00 when all channels are zero, 0xFF otherwise.
 				// This avoids a conditional branch that would inhibit auto-vectorisation.
@@ -713,11 +707,11 @@ func mainLoop(hostPort, domain, user, password string, width, height int, swap_a
 							copy(stage.all[:stage.pitch*h], y[:stage.pitch*h])
 							copy(stage.all[yBaseLen:yBaseLen+uvLen], uv[:uvLen])
 						} else {
-							for row := 0; row < h; row++ {
+							for row := range h {
 								dstOff := (destY+row)*stage.pitch + destX
 								copy(stage.all[dstOff:dstOff+w], y[row*yStride:row*yStride+w])
 							}
-							for row := 0; row < ph; row++ {
+							for row := range ph {
 								dstOff := yBaseLen + (destY/2+row)*stage.pitch + destX
 								copy(stage.all[dstOff:dstOff+w], uv[row*uvStride:row*uvStride+w])
 							}
@@ -752,8 +746,8 @@ func mainLoop(hostPort, domain, user, password string, width, height int, swap_a
 						destX: destX, destY: destY, w: w, h: h,
 						format: yuvTextureFormat,
 						y:      buf[:yLen], yStride: yStride,
-						uv:     buf[yLen : yLen+uvLen], uvStride: uvStride,
-						buf:    buf,
+						uv: buf[yLen : yLen+uvLen], uvStride: uvStride,
+						buf: buf,
 					}
 					select {
 					case yuvCh <- frame:
@@ -790,15 +784,15 @@ func mainLoop(hostPort, domain, user, password string, width, height int, swap_a
 							copy(stage.all[vBaseLen:vBaseLen+uvLen], v[:uvLen])
 						} else {
 							w2 := (w + 1) / 2
-							for row := 0; row < h; row++ {
+							for row := range h {
 								dstOff := (destY+row)*stage.pitch + destX
 								copy(stage.all[dstOff:dstOff+w], y[row*yStride:row*yStride+w])
 							}
-							for row := 0; row < ph; row++ {
+							for row := range ph {
 								dstOff := uBaseLen + (destY/2+row)*uPitch + destX/2
 								copy(stage.all[dstOff:dstOff+w2], u[row*uStride:row*uStride+w2])
 							}
-							for row := 0; row < ph; row++ {
+							for row := range ph {
 								dstOff := vBaseLen + (destY/2+row)*uPitch + destX/2
 								copy(stage.all[dstOff:dstOff+w2], v[row*vStride:row*vStride+w2])
 							}
@@ -833,9 +827,9 @@ func mainLoop(hostPort, domain, user, password string, width, height int, swap_a
 						destX: destX, destY: destY, w: w, h: h,
 						format: yuvTextureFormat,
 						y:      buf[:yLen], yStride: yStride,
-						u:      buf[yLen : yLen+uLen], uStride: uStride,
-						v:      buf[yLen+uLen : yLen+uLen+vLen], vStride: vStride,
-						buf:    buf,
+						u: buf[yLen : yLen+uLen], uStride: uStride,
+						v: buf[yLen+uLen : yLen+uLen+vLen], vStride: vStride,
+						buf: buf,
 					}
 					select {
 					case yuvCh <- frame:
