@@ -238,6 +238,34 @@ type yuvStage struct {
 // that Unlock (and the resulting Metal command-buffer commit) is safe to call.
 type yuvDone struct {
 	destX, destY, w, h int
+	isNull              bool // true when the decoded frame is all-zero (VideoToolbox flush/init artifact)
+}
+
+// isNullYUVFrame samples 8 evenly-spaced values from each of the Y and chroma
+// planes and returns true only when every sampled value is zero.  In
+// limited-range YUV (the standard for H.264) a legitimate black frame has
+// Y≥16 and chroma=128, so Y=0 across multiple samples is a reliable marker
+// for a null/corrupt decoder output rather than real content.  In full-range
+// YUV a black frame has Y=0 but chroma=128, so the chroma check prevents
+// false positives.  The O(16) cost is negligible compared to the frame copy.
+func isNullYUVFrame(y, chroma []byte) bool {
+	ny, nc := len(y), len(chroma)
+	if ny == 0 || nc == 0 {
+		return false // zero-length slices are handled upstream
+	}
+	yStep := max(1, ny/8)
+	for i := 0; i < ny; i += yStep {
+		if y[i] != 0 {
+			return false
+		}
+	}
+	cStep := max(1, nc/8)
+	for i := 0; i < nc; i += cStep {
+		if chroma[i] != 0 {
+			return false
+		}
+	}
+	return true
 }
 
 func mainLoop(hostPort, domain, user, password string, width, height int, swap_alt_meta bool, keyboardType, keyboardLayout string) (err error) {
@@ -693,7 +721,7 @@ func mainLoop(hostPort, domain, user, password string, width, height int, swap_a
 								copy(stage.all[dstOff:dstOff+w], uv[row*uvStride:row*uvStride+w])
 							}
 						}
-						done := yuvDone{destX: destX, destY: destY, w: w, h: h}
+						done := yuvDone{destX: destX, destY: destY, w: w, h: h, isNull: isNullYUVFrame(y, uv)}
 						select {
 						case yuvDoneCh <- done:
 						default:
@@ -773,7 +801,7 @@ func mainLoop(hostPort, domain, user, password string, width, height int, swap_a
 								copy(stage.all[dstOff:dstOff+w2], v[row*vStride:row*vStride+w2])
 							}
 						}
-						done := yuvDone{destX: destX, destY: destY, w: w, h: h}
+						done := yuvDone{destX: destX, destY: destY, w: w, h: h, isNull: isNullYUVFrame(y, u)}
 						select {
 						case yuvDoneCh <- done:
 						default:
@@ -953,7 +981,6 @@ func mainLoop(hostPort, domain, user, password string, width, height int, swap_a
 				// updates only write the changed region, so unwritten UV bytes in
 				// the fresh zero-filled MTLBuffer must be set to 128 or they render
 				// green (Y=0,UV=0 ≈ RGB(0,136,0) in BT.601).
-				_ = done // destX/destY reserved for future use
 				if stage := preLockYUV(yuvTexture, width, height, yuvTextureFormat, true); stage != nil {
 					select {
 					case yuvStageCh <- stage:
@@ -965,8 +992,13 @@ func mainLoop(hostPort, domain, user, password string, width, height int, swap_a
 					slog.Warn("YUV pre-lock failed after frame, switching to fallback path")
 					yuvPrimaryPath = false
 				}
-				yuvReady = true
-				dirty = true
+				if !done.isNull {
+					// Null frames (VideoToolbox flush/init artifacts: Y=0,UV=0) are
+					// unlocked above to keep the pipeline moving, but not rendered —
+					// showing them would flash green for one display frame.
+					yuvReady = true
+					dirty = true
+				}
 			default:
 			}
 		} else {
