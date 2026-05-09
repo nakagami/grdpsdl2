@@ -138,11 +138,23 @@ func uploadYUVFrame(frame yuvFrame, texture *sdl.Texture, rect *sdl.Rect) {
 }
 
 // audioPlayer manages SDL2 audio device for RDPSND playback.
-// The device is opened once on the main thread at startup with a fixed format
-// (44100 Hz / stereo / S16LE). play() only calls sdl.QueueAudio which is
-// thread-safe and can be invoked from any goroutine.
+// The device is opened once on the main thread at startup with a fixed output
+// format (44100 Hz / stereo / S16LE).  play() converts incoming audio from
+// whatever format the server negotiated (any PCM rate/channels/bit-depth) to
+// the device format using SDL2's BuildAudioCVT/ConvertAudio, then enqueues the
+// result.  All fields except deviceID are protected by mu and may be accessed
+// from any goroutine.
+//
+// sdl.AudioCVT is intentionally NOT stored as a struct field: it embeds C
+// function pointers (filter callbacks) that could interfere with Go's GC if
+// kept on the heap between calls.  Instead it is allocated as a local variable
+// inside play() for the duration of each conversion.
 type audioPlayer struct {
 	deviceID sdl.AudioDeviceID
+	mu       sync.Mutex // protects cvtKey, cvtNeed, cvtBuf
+	cvtKey   [3]int     // [SamplesPerSec, Channels, BitsPerSample] of the last-probed CVT
+	cvtNeed  bool       // true when the last-probed CVT actually transforms data
+	cvtBuf   []byte     // reusable scratch buffer for in-place conversion
 }
 
 // open opens the audio device on the calling (main) thread.
@@ -164,6 +176,10 @@ func (a *audioPlayer) open() error {
 	return nil
 }
 
+// play converts audio from the server-negotiated format af to the device's
+// fixed 44100 Hz / stereo / S16LE format (using SDL2 AudioCVT) and queues it
+// for playback.  Incoming audio is dropped when the device queue is already
+// near-full to prevent runaway latency.  Safe to call from any goroutine.
 func (a *audioPlayer) play(af rdpsnd.AudioFormat, data []byte) {
 	if a.deviceID == 0 {
 		return
@@ -171,17 +187,78 @@ func (a *audioPlayer) play(af rdpsnd.AudioFormat, data []byte) {
 	if sdl.GetQueuedAudioSize(a.deviceID) >= maxAudioQueueBytes {
 		return // drop to prevent latency buildup
 	}
-	if err := sdl.QueueAudio(a.deviceID, data); err != nil {
-		slog.Error("audio: QueueAudio", "err", err)
+
+	key := [3]int{int(af.SamplesPerSec), int(af.Channels), int(af.BitsPerSample)}
+	// 8-bit PCM in WAVE is unsigned; 16-bit is signed little-endian.
+	var srcFmt sdl.AudioFormat = sdl.AUDIO_S16LSB
+	if af.BitsPerSample == 8 {
+		srcFmt = sdl.AUDIO_U8
+	}
+
+	a.mu.Lock()
+	defer a.mu.Unlock()
+
+	// Probe the CVT when the server changes format (rare, usually once per session).
+	if key != a.cvtKey {
+		a.cvtKey = key
+		a.cvtNeed = false
+		var probeCVT sdl.AudioCVT
+		ok, err := sdl.BuildAudioCVT(&probeCVT, srcFmt, uint8(key[1]), key[0],
+			sdl.AUDIO_S16LSB, 2, 44100)
+		if err != nil {
+			slog.Error("audio: BuildAudioCVT", "err", err, "src", af)
+			return
+		}
+		a.cvtNeed = ok
+		slog.Debug("audio: CVT", "src", af, "needs_cvt", ok)
+	}
+
+	if !a.cvtNeed {
+		// Format already matches the device; queue directly.
+		if err := sdl.QueueAudio(a.deviceID, data); err != nil {
+			slog.Error("audio: QueueAudio", "err", err)
+		}
+		return
+	}
+
+	// SDL_ConvertAudio works in-place: copy source into a buffer of size
+	// len(data)*LenMult, set cvt.Buf/Len, call ConvertAudio, read LenCVT bytes.
+	// Build a fresh local CVT (not stored on the heap) for each conversion so
+	// the C filter-function pointers it contains are stack-lived only.
+	var cvt sdl.AudioCVT
+	if _, err := sdl.BuildAudioCVT(&cvt, srcFmt, uint8(key[1]), key[0],
+		sdl.AUDIO_S16LSB, 2, 44100); err != nil {
+		slog.Error("audio: BuildAudioCVT", "err", err, "src", af)
+		return
+	}
+	needed := len(data) * int(cvt.LenMult)
+	if cap(a.cvtBuf) < needed {
+		a.cvtBuf = make([]byte, needed)
+	}
+	a.cvtBuf = a.cvtBuf[:needed]
+	copy(a.cvtBuf, data)
+	cvt.Buf = unsafe.Pointer(&a.cvtBuf[0])
+	cvt.Len = int32(len(data))
+	if err := sdl.ConvertAudio(&cvt); err != nil {
+		slog.Error("audio: ConvertAudio", "err", err)
+		return
+	}
+	if err := sdl.QueueAudio(a.deviceID, a.cvtBuf[:cvt.LenCVT]); err != nil {
+		slog.Error("audio: QueueAudio (converted)", "err", err)
 	}
 }
 
-// reset discards all buffered audio data.  Called on server-side audio reset
-// (e.g. seek) so stale audio does not keep playing after the stream restarts.
+// reset discards all buffered audio data and forces a CVT re-probe on the next
+// call to play().  Called on server-side audio reset (e.g. seek) so stale audio
+// does not keep playing after the stream restarts.
 func (a *audioPlayer) reset() {
 	if a.deviceID != 0 {
 		sdl.ClearQueuedAudio(a.deviceID)
 	}
+	a.mu.Lock()
+	a.cvtKey = [3]int{} // force re-probe
+	a.cvtNeed = false
+	a.mu.Unlock()
 }
 
 func (a *audioPlayer) close() {
@@ -1261,8 +1338,8 @@ func main() {
 	// thread, causing subtle crashes or missing events on macOS.
 	runtime.LockOSThread()
 
-	// handler := slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelDebug})
-	// slog.SetDefault(slog.New(handler))
+	handler := slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelDebug})
+	slog.SetDefault(slog.New(handler))
 
 	swap_alt_meta := flag.Bool("swap-alt-meta", false, "swap alt and meta key")
 	flag.Parse()
