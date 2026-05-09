@@ -344,6 +344,33 @@ func mainLoop(hostPort, domain, user, password string, width, height int, swap_a
 		defer yuvTexture.Destroy()
 	}
 
+	// initYUVBlack writes neutral black (Y=0, chroma=128) into a YUV streaming
+	// texture so that any render before the first decoded H.264 frame shows black
+	// instead of green.  (Uninitialized NV12/IYUV bytes are typically all-zero;
+	// Y=0,U=0,V=0 maps to RGB≈(0,136,0) — the momentary green flash.)
+	initYUVBlack := func(tex *sdl.Texture, w, h int, format uint32) {
+		yBuf := make([]byte, w*h)          // Y=0 (full-range black luma)
+		ph := (h + 1) / 2
+		if format == sdlPixelFormatNV12 {
+			uvBuf := make([]byte, w*ph)    // interleaved UV; 128 = neutral chroma
+			for i := range uvBuf {
+				uvBuf[i] = 128
+			}
+			tex.UpdateNV(nil, yBuf, w, uvBuf, w)
+		} else {
+			// IYUV / I420: separate U and V planes, each half-width.
+			hw := (w + 1) / 2
+			uvBuf := make([]byte, hw*ph)
+			for i := range uvBuf {
+				uvBuf[i] = 128
+			}
+			tex.UpdateYUV(nil, yBuf, w, uvBuf, hw, uvBuf, hw)
+		}
+	}
+	if yuvTexture != nil {
+		initYUVBlack(yuvTexture, width, height, yuvTextureFormat)
+	}
+
 	// overlayZero is a pre-zeroed buffer used to reset the overlay texture to
 	// fully transparent (BGRA 0,0,0,0) after each H264 full-frame update,
 	// ensuring stale non-H264 patches do not obscure the new H264 baseline.
@@ -802,11 +829,14 @@ func mainLoop(hostPort, domain, user, password string, width, height int, swap_a
 				slog.Warn("IYUV recreate failed after reconnect", "err", rerr)
 				yuvTexture = nil
 				yuvPrimaryPath = false
-			} else if stage := preLockYUV(yuvTexture, int(w), int(h), yuvTextureFormat); stage != nil {
-				yuvPrimaryPath = true
-				yuvStageCh <- stage
 			} else {
-				yuvPrimaryPath = false
+				initYUVBlack(yuvTexture, int(w), int(h), yuvTextureFormat)
+				if stage := preLockYUV(yuvTexture, int(w), int(h), yuvTextureFormat); stage != nil {
+					yuvPrimaryPath = true
+					yuvStageCh <- stage
+				} else {
+					yuvPrimaryPath = false
+				}
 			}
 		}
 		yuvReady = false
