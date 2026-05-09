@@ -207,6 +207,7 @@ type yuvFrame struct {
 	uv                 []byte
 	uvStride           int
 	buf                []byte
+	isNull             bool // true when the decoded frame is all-zero (VideoToolbox flush/init artifact)
 }
 
 // yuvStage describes the SDL2 YUV texture's pre-locked staging buffer.
@@ -740,8 +741,9 @@ func mainLoop(hostPort, domain, user, password string, width, height int, swap_a
 						destX: destX, destY: destY, w: w, h: h,
 						format: yuvTextureFormat,
 						y:      buf[:yLen], yStride: yStride,
-						uv: buf[yLen : yLen+uvLen], uvStride: uvStride,
-						buf: buf,
+						uv:     buf[yLen : yLen+uvLen], uvStride: uvStride,
+						buf:    buf,
+						isNull: isNullYUVFrame(y, uv),
 					}
 					select {
 					case yuvCh <- frame:
@@ -821,9 +823,10 @@ func mainLoop(hostPort, domain, user, password string, width, height int, swap_a
 						destX: destX, destY: destY, w: w, h: h,
 						format: yuvTextureFormat,
 						y:      buf[:yLen], yStride: yStride,
-						u: buf[yLen : yLen+uLen], uStride: uStride,
-						v: buf[yLen+uLen : yLen+uLen+vLen], vStride: vStride,
-						buf: buf,
+						u:      buf[yLen : yLen+uLen], uStride: uStride,
+						v:      buf[yLen+uLen : yLen+uLen+vLen], vStride: vStride,
+						buf:    buf,
+						isNull: isNullYUVFrame(y, u),
 					}
 					select {
 					case yuvCh <- frame:
@@ -967,6 +970,12 @@ func mainLoop(hostPort, domain, user, password string, width, height int, swap_a
 			case done := <-yuvDoneCh:
 				clearOverlayDirty()
 				yuvTexture.Unlock() // GPU upload: grdp → MTLBuffer already done by callback
+				if done.isNull {
+					// The null frame (Y=0,UV=0 = green in BT.601) has just been committed
+					// to the GPU texture.  Overwrite it with black so that a subsequent
+					// bitmap dirty does not flash green through the non-bitmap regions.
+					initYUVBlack(yuvTexture, width, height, yuvTextureFormat)
+				}
 				// Re-lock immediately so the next callback can write without waiting.
 				// Always initialise chroma to 128 (neutral) on every re-lock:
 				// Metal's staging MTLBuffer pool may hand us a freshly zeroed buffer,
@@ -1012,12 +1021,18 @@ func mainLoop(hostPort, domain, user, password string, width, height int, swap_a
 				}
 			}
 			if haveYUV {
-				clearOverlayDirty()
-				rect := sdl.Rect{X: int32(latestYUV.destX), Y: int32(latestYUV.destY), W: int32(latestYUV.w), H: int32(latestYUV.h)}
-				uploadYUVFrame(latestYUV, yuvTexture, &rect)
-				yuvBufPool.Put(latestYUV.buf)
-				yuvReady = true
-				dirty = true
+				if latestYUV.isNull {
+					// Null frame (Y=0,UV=0): discard — uploading green data would flash
+					// through non-bitmap areas.  Keep the previous real frame visible.
+					yuvBufPool.Put(latestYUV.buf)
+				} else {
+					clearOverlayDirty()
+					rect := sdl.Rect{X: int32(latestYUV.destX), Y: int32(latestYUV.destY), W: int32(latestYUV.w), H: int32(latestYUV.h)}
+					uploadYUVFrame(latestYUV, yuvTexture, &rect)
+					yuvBufPool.Put(latestYUV.buf)
+					yuvReady = true
+					dirty = true
+				}
 			}
 		}
 
