@@ -47,14 +47,8 @@ func paintImages(bs []grdp.Bitmap, texture *sdl.Texture, dirtyRects *[]sdl.Rect)
 			// Use the smaller of the destination rectangle and the actual
 			// image dimensions (same clamping as before).
 			img := bm.RGBA()
-			w := bm.DestRight - bm.DestLeft + 1
-			if imgW := img.Bounds().Dx(); w > imgW {
-				w = imgW
-			}
-			h := bm.DestBottom - bm.DestTop + 1
-			if imgH := img.Bounds().Dy(); h > imgH {
-				h = imgH
-			}
+			w := min(bm.DestRight-bm.DestLeft+1, img.Bounds().Dx())
+			h := min(bm.DestBottom-bm.DestTop+1, img.Bounds().Dy())
 			p := img.Pix
 			for i := 0; i < len(p); i += 4 {
 				p[i], p[i+2] = p[i+2], p[i]
@@ -535,6 +529,8 @@ func mainLoop(hostPort, domain, user, password string, width, height int, swap_a
 
 	// Register a custom SDL event type to wake the main loop when bitmaps arrive.
 	bitmapEventType := sdl.RegisterEvents(1)
+	// Pre-allocate the wake event once so callbacks never heap-allocate on the hot path.
+	wakeEvent := &sdl.UserEvent{Type: bitmapEventType}
 
 	rdpClient := grdp.NewRdpClient(hostPort, width, height, func(hostPort string) (net.Conn, error) {
 		dialer := &net.Dialer{
@@ -628,7 +624,7 @@ func mainLoop(hostPort, domain, user, password string, width, height int, swap_a
 		// Wake the main loop immediately so it renders without waiting for
 		// WaitEventTimeout to expire.
 		if sent && bitmapEventType != sdl.FIRSTEVENT && eventPending.CompareAndSwap(false, true) {
-			sdl.PushEvent(&sdl.UserEvent{Type: bitmapEventType})
+			sdl.PushEvent(wakeEvent)
 		}
 	}).OnPointerHide(func() {
 		lastServerActivity.Store(time.Now().UnixNano())
@@ -703,7 +699,9 @@ func mainLoop(hostPort, domain, user, password string, width, height int, swap_a
 						// than the texture (e.g. a video window inside the desktop).
 						yBaseLen := stage.pitch * stage.th
 						uvLen := stage.pitch * ph
-						if stage.pitch == yStride && destX == 0 && destY == 0 {
+						fastPath := stage.pitch == yStride && destX == 0 && destY == 0
+						fullFrame := fastPath && h == stage.th
+						if fastPath {
 							copy(stage.all[:stage.pitch*h], y[:stage.pitch*h])
 							copy(stage.all[yBaseLen:yBaseLen+uvLen], uv[:uvLen])
 						} else {
@@ -717,7 +715,7 @@ func mainLoop(hostPort, domain, user, password string, width, height int, swap_a
 							}
 						}
 						done := yuvDone{destX: destX, destY: destY, w: w, h: h, isNull: isNullYUVFrame(y, uv),
-							fullFrame: stage.pitch == yStride && destX == 0 && destY == 0 && h == stage.th}
+							fullFrame: fullFrame}
 						select {
 						case yuvDoneCh <- done:
 						default:
@@ -757,7 +755,7 @@ func mainLoop(hostPort, domain, user, password string, width, height int, swap_a
 					}
 				}
 				if bitmapEventType != sdl.FIRSTEVENT && eventPending.CompareAndSwap(false, true) {
-					sdl.PushEvent(&sdl.UserEvent{Type: bitmapEventType})
+					sdl.PushEvent(wakeEvent)
 				}
 			})
 		} else {
@@ -778,7 +776,9 @@ func mainLoop(hostPort, domain, user, password string, width, height int, swap_a
 						uvLen := uPitch * ph
 						uBaseLen := yBaseLen + uPitch*ph_tex
 						vBaseLen := uBaseLen + uPitch*ph_tex
-						if stage.pitch == yStride && uPitch == uStride && destX == 0 && destY == 0 {
+						fastPath := stage.pitch == yStride && uPitch == uStride && destX == 0 && destY == 0
+						fullFrame := fastPath && h == stage.th
+						if fastPath {
 							copy(stage.all[:stage.pitch*h], y[:stage.pitch*h])
 							copy(stage.all[uBaseLen:uBaseLen+uvLen], u[:uvLen])
 							copy(stage.all[vBaseLen:vBaseLen+uvLen], v[:uvLen])
@@ -798,7 +798,7 @@ func mainLoop(hostPort, domain, user, password string, width, height int, swap_a
 							}
 						}
 						done := yuvDone{destX: destX, destY: destY, w: w, h: h, isNull: isNullYUVFrame(y, u),
-							fullFrame: stage.pitch == yStride && uPitch == uStride && destX == 0 && destY == 0 && h == stage.th}
+							fullFrame: fullFrame}
 						select {
 						case yuvDoneCh <- done:
 						default:
@@ -839,7 +839,7 @@ func mainLoop(hostPort, domain, user, password string, width, height int, swap_a
 					}
 				}
 				if bitmapEventType != sdl.FIRSTEVENT && eventPending.CompareAndSwap(false, true) {
-					sdl.PushEvent(&sdl.UserEvent{Type: bitmapEventType})
+					sdl.PushEvent(wakeEvent)
 				}
 			})
 		}
