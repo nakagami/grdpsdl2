@@ -150,9 +150,10 @@ func uploadYUVFrame(frame yuvFrame, texture *sdl.Texture, rect *sdl.Rect) {
 // kept on the heap between calls.  Instead it is allocated as a local variable
 // inside play() for the duration of each conversion.
 type audioPlayer struct {
-	deviceID sdl.AudioDeviceID
-	mu       sync.Mutex // protects cvtKey, cvtNeed, cvtBuf
-	cvtKey   [3]int     // [SamplesPerSec, Channels, BitsPerSample] of the last-probed CVT
+	deviceID     sdl.AudioDeviceID
+	reopenNeeded atomic.Bool  // set from play() on "Invalid audio device ID"; cleared by reopen() on main thread
+	mu           sync.Mutex   // protects cvtKey, cvtNeed, cvtBuf
+	cvtKey       [3]int       // [SamplesPerSec, Channels, BitsPerSample] of the last-probed CVT
 	cvtNeed  bool       // true when the last-probed CVT actually transforms data
 	cvtBuf   []byte     // reusable scratch buffer for in-place conversion
 }
@@ -216,7 +217,11 @@ func (a *audioPlayer) play(af rdpsnd.AudioFormat, data []byte) {
 	if !a.cvtNeed {
 		// Format already matches the device; queue directly.
 		if err := sdl.QueueAudio(a.deviceID, data); err != nil {
-			slog.Error("audio: QueueAudio", "err", err)
+			if strings.Contains(err.Error(), "Invalid audio device ID") {
+				a.reopenNeeded.Store(true)
+			} else {
+				slog.Error("audio: QueueAudio", "err", err)
+			}
 		}
 		return
 	}
@@ -244,7 +249,11 @@ func (a *audioPlayer) play(af rdpsnd.AudioFormat, data []byte) {
 		return
 	}
 	if err := sdl.QueueAudio(a.deviceID, a.cvtBuf[:cvt.LenCVT]); err != nil {
-		slog.Error("audio: QueueAudio (converted)", "err", err)
+		if strings.Contains(err.Error(), "Invalid audio device ID") {
+			a.reopenNeeded.Store(true)
+		} else {
+			slog.Error("audio: QueueAudio (converted)", "err", err)
+		}
 	}
 }
 
@@ -265,6 +274,16 @@ func (a *audioPlayer) close() {
 	if a.deviceID != 0 {
 		sdl.CloseAudioDevice(a.deviceID)
 		a.deviceID = 0
+	}
+}
+
+// reopen closes and reopens the audio device on the calling (main) thread.
+// Called after play() signals reopenNeeded due to "Invalid audio device ID".
+func (a *audioPlayer) reopen() {
+	slog.Warn("audio: device invalid, reopening")
+	a.close()
+	if err := a.open(); err != nil {
+		slog.Error("audio: reopen failed, audio disabled", "err", err)
 	}
 }
 
@@ -968,6 +987,8 @@ func mainLoop(hostPort, domain, user, password string, width, height int, swap_a
 			}
 		}
 		yuvReady = false
+		ap.reopenNeeded.Store(false)
+		ap.reset()
 	}
 
 	quit := false
@@ -1201,6 +1222,13 @@ func mainLoop(hostPort, domain, user, password string, width, height int, swap_a
 				}
 			}
 		}
+		// Audio device recovery: play() sets reopenNeeded when SDL2 reports
+		// "Invalid audio device ID" (macOS Core Audio sometimes invalidates the
+		// device after many reconnects).  Reopen on the main thread to satisfy
+		// SDL2/Core Audio threading requirements.
+		if ap.reopenNeeded.CompareAndSwap(true, false) {
+			ap.reopen()
+		}
 	}
 
 	err = window.Destroy()
@@ -1338,8 +1366,8 @@ func main() {
 	// thread, causing subtle crashes or missing events on macOS.
 	runtime.LockOSThread()
 
-	handler := slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelDebug})
-	slog.SetDefault(slog.New(handler))
+	// handler := slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelDebug})
+	// slog.SetDefault(slog.New(handler))
 
 	swap_alt_meta := flag.Bool("swap-alt-meta", false, "swap alt and meta key")
 	flag.Parse()
