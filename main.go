@@ -297,7 +297,17 @@ func mainLoop(hostPort, domain, user, password string, width, height int, swap_a
 			height = int(we.Data2)
 		}
 	}
-	renderer, err := sdl.CreateRenderer(window, -1, sdl.RENDERER_ACCELERATED)
+	// Prefer an accelerated renderer with VSync so that renderer.Present()
+	// waits for the display vblank.  This caps rendering to the display
+	// refresh rate (60/120 Hz), eliminates tearing, and lets the H.264
+	// callback write the next frame into the pre-locked MTLBuffer during the
+	// vblank stall — pipeline parallelism at no extra cost.
+	// Fall back to accelerated without VSync, then software without VSync.
+	renderer, err := sdl.CreateRenderer(window, -1, sdl.RENDERER_ACCELERATED|sdl.RENDERER_PRESENTVSYNC)
+	if err != nil {
+		slog.Warn("vsync renderer unavailable, trying without vsync", "err", err)
+		renderer, err = sdl.CreateRenderer(window, -1, sdl.RENDERER_ACCELERATED)
+	}
 	if err != nil {
 		slog.Warn("hardware renderer unavailable, falling back to software", "err", err)
 		renderer, err = sdl.CreateRenderer(window, -1, sdl.RENDERER_SOFTWARE)
@@ -396,7 +406,12 @@ func mainLoop(hostPort, domain, user, password string, width, height int, swap_a
 	// preLockYUV locks the full YUV streaming texture and returns a yuvStage
 	// that H.264 callbacks can write directly into.  Must be called from the
 	// main (SDL) goroutine.  Returns nil if Lock fails (e.g. software renderer).
-	preLockYUV := func(tex *sdl.Texture, tw, th int, format uint32) *yuvStage {
+	// initChroma should be true on the first lock and after any reconnect so
+	// that unwritten chroma regions show black (neutral 128) instead of green.
+	// After a full-frame H.264 write (destX=0, destY=0, w=tw, h=th) the
+	// decoder overwrites every chroma byte, so initChroma can be false —
+	// saving ~1 MB of memset at 60fps.
+	preLockYUV := func(tex *sdl.Texture, tw, th int, format uint32, initChroma bool) *yuvStage {
 		pixels, pitch, err := tex.Lock(nil)
 		if err != nil {
 			return nil
@@ -404,16 +419,30 @@ func mainLoop(hostPort, domain, user, password string, width, height int, swap_a
 		ph := (th + 1) / 2
 		var bufLen int
 		if format == sdlPixelFormatNV12 {
-			bufLen = pitch*th + pitch*ph
+			yLen := pitch * th
+			uvLen := pitch * ph
+			bufLen = yLen + uvLen
+			all := unsafe.Slice(&pixels[0], bufLen)
+			if initChroma {
+				uv := all[yLen:]
+				for i := range uv {
+					uv[i] = 128
+				}
+			}
+			return &yuvStage{all: all, pitch: pitch, tw: tw, th: th}
 		} else {
 			uPitch := (pitch + 1) / 2
-			bufLen = pitch*th + 2*uPitch*ph
-		}
-		return &yuvStage{
-			all:   unsafe.Slice(&pixels[0], bufLen),
-			pitch: pitch,
-			tw:    tw,
-			th:    th,
+			yLen := pitch * th
+			uvLen := uPitch * ph
+			bufLen = yLen + 2*uvLen
+			all := unsafe.Slice(&pixels[0], bufLen)
+			if initChroma {
+				uv := all[yLen:]
+				for i := range uv {
+					uv[i] = 128
+				}
+			}
+			return &yuvStage{all: all, pitch: pitch, tw: tw, th: th}
 		}
 	}
 
@@ -441,7 +470,7 @@ func mainLoop(hostPort, domain, user, password string, width, height int, swap_a
 	// the code automatically degrades to the pool-buffer fallback path.
 	yuvPrimaryPath := false
 	if yuvTexture != nil {
-		if stage := preLockYUV(yuvTexture, width, height, yuvTextureFormat); stage != nil {
+		if stage := preLockYUV(yuvTexture, width, height, yuvTextureFormat, true); stage != nil {
 			yuvPrimaryPath = true
 			yuvStageCh <- stage
 		}
@@ -831,7 +860,7 @@ func mainLoop(hostPort, domain, user, password string, width, height int, swap_a
 				yuvPrimaryPath = false
 			} else {
 				initYUVBlack(yuvTexture, int(w), int(h), yuvTextureFormat)
-				if stage := preLockYUV(yuvTexture, int(w), int(h), yuvTextureFormat); stage != nil {
+				if stage := preLockYUV(yuvTexture, int(w), int(h), yuvTextureFormat, true); stage != nil {
 					yuvPrimaryPath = true
 					yuvStageCh <- stage
 				} else {
@@ -920,7 +949,12 @@ func mainLoop(hostPort, domain, user, password string, width, height int, swap_a
 				clearOverlayDirty()
 				yuvTexture.Unlock() // GPU upload: grdp → MTLBuffer already done by callback
 				// Re-lock immediately so the next callback can write without waiting.
-				if stage := preLockYUV(yuvTexture, width, height, yuvTextureFormat); stage != nil {
+				// Always initialise chroma to 128 (neutral): H.264 partial-frame
+				// updates only write the changed region, so unwritten UV bytes in
+				// the fresh zero-filled MTLBuffer must be set to 128 or they render
+				// green (Y=0,UV=0 ≈ RGB(0,136,0) in BT.601).
+				_ = done // destX/destY reserved for future use
+				if stage := preLockYUV(yuvTexture, width, height, yuvTextureFormat, true); stage != nil {
 					select {
 					case yuvStageCh <- stage:
 					default:
@@ -931,7 +965,6 @@ func mainLoop(hostPort, domain, user, password string, width, height int, swap_a
 					slog.Warn("YUV pre-lock failed after frame, switching to fallback path")
 					yuvPrimaryPath = false
 				}
-				_ = done // destX/destY not needed; we locked the full texture
 				yuvReady = true
 				dirty = true
 			default:
@@ -1182,6 +1215,13 @@ var scancodeMap = map[sdl.Scancode]int{
 }
 
 func main() {
+	// LockOSThread pins the main goroutine to the OS thread for the lifetime
+	// of the process.  SDL2 on macOS requires all rendering and event calls
+	// to originate from the main OS thread (Cocoa / NSApplication constraint).
+	// Without this the Go scheduler may migrate the goroutine to a different
+	// thread, causing subtle crashes or missing events on macOS.
+	runtime.LockOSThread()
+
 	// handler := slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelDebug})
 	// slog.SetDefault(slog.New(handler))
 
