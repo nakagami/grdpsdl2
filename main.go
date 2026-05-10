@@ -804,7 +804,15 @@ func mainLoop(hostPort, domain, user, password string, width, height int, swap_a
 						// Y and UV byte will be overwritten — the next lock can skip
 						// the UV pre-initialisation (saves ~1 MB memset per frame).
 						fullTexture := fastPath && h == stage.th
-						if fastPath {
+						isNull := isNullYUVFrame(y, uv)
+						if isNull {
+							// Fill UV with 128 (neutral chroma) so Unlock commits black
+							// instead of green.  Metal staging buffers may be freshly
+							// zeroed (UV=0); Y=0,UV=0 renders as green in BT.601.
+							for i := range stage.all[yBaseLen:] {
+								stage.all[yBaseLen+i] = 128
+							}
+						} else if fastPath {
 							copy(stage.all[:stage.pitch*h], y[:stage.pitch*h])
 							copy(stage.all[yBaseLen:yBaseLen+uvLen], uv[:uvLen])
 						} else {
@@ -818,7 +826,7 @@ func mainLoop(hostPort, domain, user, password string, width, height int, swap_a
 							}
 						}
 						done := yuvDone{destX: destX, destY: destY, w: w, h: h,
-							isNull: isNullYUVFrame(y, uv), fullTexture: fullTexture}
+							isNull: isNull, fullTexture: fullTexture && !isNull}
 						select {
 						case yuvDoneCh <- done:
 						default:
@@ -884,7 +892,15 @@ func mainLoop(hostPort, domain, user, password string, width, height int, swap_a
 						vBaseLen := uBaseLen + uPitch*ph_tex
 						fastPath := stage.pitch == yStride && uPitch == uStride && destX == 0 && destY == 0
 						fullTexture := fastPath && h == stage.th
-						if fastPath {
+						isNull := isNullYUVFrame(y, u)
+						if isNull {
+							// Fill U and V planes with 128 so Unlock commits black
+							// instead of green.  Metal staging buffers may be freshly
+							// zeroed (UV=0); Y=0,UV=0 renders as green in BT.601.
+							for i := range stage.all[uBaseLen:] {
+								stage.all[uBaseLen+i] = 128
+							}
+						} else if fastPath {
 							copy(stage.all[:stage.pitch*h], y[:stage.pitch*h])
 							copy(stage.all[uBaseLen:uBaseLen+uvLen], u[:uvLen])
 							copy(stage.all[vBaseLen:vBaseLen+uvLen], v[:uvLen])
@@ -904,7 +920,7 @@ func mainLoop(hostPort, domain, user, password string, width, height int, swap_a
 							}
 						}
 						done := yuvDone{destX: destX, destY: destY, w: w, h: h,
-							isNull: isNullYUVFrame(y, u), fullTexture: fullTexture}
+							isNull: isNull, fullTexture: fullTexture && !isNull}
 						select {
 						case yuvDoneCh <- done:
 						default:
@@ -1081,13 +1097,14 @@ func mainLoop(hostPort, domain, user, password string, width, height int, swap_a
 			// immediately re-lock so the staging buffer is ready for the next frame.
 			select {
 			case done := <-yuvDoneCh:
-				clearOverlayDirty()
 				yuvTexture.Unlock() // GPU upload: grdp → MTLBuffer already done by callback
 				if done.isNull {
-					// The null frame (Y=0,UV=0 = green in BT.601) has just been committed
-					// to the GPU texture.  Overwrite it with black so that a subsequent
-					// bitmap dirty does not flash green through the non-bitmap regions.
+					// The callback already wrote UV=128 into the staging buffer so
+					// Unlock committed black, not green.  initYUVBlack is a safety net.
+					// Do NOT clear the overlay: null frames must not erase bitmap patches.
 					initYUVBlack(yuvTexture, width, height, yuvTextureFormat)
+				} else {
+					clearOverlayDirty()
 				}
 				// Re-lock immediately so the next callback can write without waiting.
 				// Skip UV pre-initialisation when the last frame was full-texture:
@@ -1095,10 +1112,7 @@ func mainLoop(hostPort, domain, user, password string, width, height int, swap_a
 				// staging buffer (even if freshly zeroed by the pool) has correct 4:2:0
 				// chroma.  For partial frames the init is still required to avoid green
 				// fringes (UV=0 ≈ RGB(0,136,0) in BT.601) in unwritten regions.
-				// After a null frame, always reinit (null frames write Y=0,UV=0).
-				// Skip UV pre-initialisation when the current frame already wrote
-				// every UV byte (full-texture fast path).  Always reinit after a
-				// null frame (VideoToolbox flush: Y=0,UV=0 bytes were written).
+				// After a null frame, always reinit (chroma must be set to 128).
 				needsChromaInit := !done.fullTexture || done.isNull
 				if stage := preLockYUV(yuvTexture, width, height, yuvTextureFormat, needsChromaInit); stage != nil {
 					select {
@@ -1386,8 +1400,8 @@ func main() {
 	// thread, causing subtle crashes or missing events on macOS.
 	runtime.LockOSThread()
 
-	// handler := slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelDebug})
-	// slog.SetDefault(slog.New(handler))
+	handler := slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelDebug})
+	slog.SetDefault(slog.New(handler))
 
 	swap_alt_meta := flag.Bool("swap-alt-meta", false, "swap alt and meta key")
 	flag.Parse()
