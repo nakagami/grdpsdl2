@@ -827,8 +827,9 @@ func mainLoop(hostPort, domain, user, password string, width, height int, swap_a
 							// Fill UV with 128 (neutral chroma) so Unlock commits black
 							// instead of green.  Metal staging buffers may be freshly
 							// zeroed (UV=0); Y=0,UV=0 renders as green in BT.601.
-							for i := range stage.all[yBaseLen:] {
-								stage.all[yBaseLen+i] = 128
+							uv := stage.all[yBaseLen:]
+							for i := range uv {
+								uv[i] = 128
 							}
 						} else if fastPath {
 							copy(stage.all[:stage.pitch*h], y[:stage.pitch*h])
@@ -917,8 +918,9 @@ func mainLoop(hostPort, domain, user, password string, width, height int, swap_a
 							// Fill U and V planes with 128 so Unlock commits black
 							// instead of green.  Metal staging buffers may be freshly
 							// zeroed (UV=0); Y=0,UV=0 renders as green in BT.601.
-							for i := range stage.all[uBaseLen:] {
-								stage.all[uBaseLen+i] = 128
+							uv := stage.all[uBaseLen:]
+							for i := range uv {
+								uv[i] = 128
 							}
 						} else if fastPath {
 							copy(stage.all[:stage.pitch*h], y[:stage.pitch*h])
@@ -1133,12 +1135,8 @@ func mainLoop(hostPort, domain, user, password string, width, height int, swap_a
 			select {
 			case done := <-yuvDoneCh:
 				yuvTexture.Unlock() // GPU upload: grdp → MTLBuffer already done by callback
-				if done.isNull {
-					// The callback already wrote UV=128 into the staging buffer so
-					// Unlock committed black, not green.  initYUVBlack is a safety net.
-					// Do NOT clear the overlay: null frames must not erase bitmap patches.
-					initYUVBlack(yuvTexture, width, height, yuvTextureFormat)
-				} else {
+				// Do NOT clear the overlay on null frames: null frames must not erase bitmap patches.
+				if !done.isNull {
 					clearOverlayDirty()
 				}
 				// Re-lock immediately so the next callback can write without waiting.
