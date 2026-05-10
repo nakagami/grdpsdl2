@@ -25,6 +25,18 @@ const sdlPixelFormatNV12 = uint32(0x3231564E) // SDL_PIXELFORMAT_NV12
 // audio packets are dropped to prevent ever-growing latency.
 const maxAudioQueueBytes = 176400
 
+// h264DropCooldown is how long after the last dropped H.264 frame we keep
+// signalling congestion to the server via the queueDepth hint.  Once this
+// window elapses without a new drop, the hint is cleared and the server
+// resumes full-quality encoding.
+const h264DropCooldown = time.Second
+
+// h264CongestionHint is the queueDepth value sent to the server while the
+// SDL rendering pipeline is dropping H.264 frames.  The server interprets
+// this as "20 frames are queued" and reduces H.264 bitrate/quality
+// accordingly.  0 = no congestion, 0xFFFFFFFF = pause entirely.
+const h264CongestionHint uint32 = 20
+
 // paintImages uploads each bitmap patch into the SDL2 streaming texture.
 // Dirty rects are appended to dirtyRects so the caller can later clear only
 // those regions (instead of the entire texture) when a new H.264 frame arrives.
@@ -517,6 +529,12 @@ func mainLoop(hostPort, domain, user, password string, width, height int, swap_a
 	yuvDoneCh := make(chan yuvDone, 1)
 	var yuvWriteWg sync.WaitGroup // counts H.264 writes currently in progress
 
+	// lastH264DropNs records the Unix nanosecond timestamp of the most recent
+	// dropped H.264 frame (0 = no recent drop).  Used to set the queueDepth
+	// hint that tells the RDP server to reduce H.264 bitrate when SDL's
+	// rendering pipeline is congested.
+	var lastH264DropNs atomic.Int64
+
 	// preLockYUV locks the full YUV streaming texture and returns a yuvStage
 	// that H.264 callbacks can write directly into.  Must be called from the
 	// main (SDL) goroutine.  Returns nil if Lock fails (e.g. software renderer).
@@ -837,6 +855,7 @@ func mainLoop(hostPort, domain, user, password string, width, height int, swap_a
 					default:
 						yuvWriteWg.Done()
 						slog.Debug("yuv stage not ready, dropping NV12 frame")
+						lastH264DropNs.Store(time.Now().UnixNano())
 					}
 				} else {
 					// Fallback path (pre-lock unavailable): copy into pool buffer.
@@ -865,6 +884,7 @@ func mainLoop(hostPort, domain, user, password string, width, height int, swap_a
 					default:
 						yuvBufPool.Put(buf)
 						slog.Warn("yuv channel full, dropping NV12 frame")
+						lastH264DropNs.Store(time.Now().UnixNano())
 					}
 				}
 				if bitmapEventType != sdl.FIRSTEVENT && eventPending.CompareAndSwap(false, true) {
@@ -930,6 +950,7 @@ func mainLoop(hostPort, domain, user, password string, width, height int, swap_a
 					default:
 						yuvWriteWg.Done()
 						slog.Debug("yuv stage not ready, dropping I420 frame")
+						lastH264DropNs.Store(time.Now().UnixNano())
 					}
 				} else {
 					ph := (h + 1) / 2
@@ -960,6 +981,7 @@ func mainLoop(hostPort, domain, user, password string, width, height int, swap_a
 					default:
 						yuvBufPool.Put(buf)
 						slog.Warn("yuv channel full, dropping I420 frame")
+						lastH264DropNs.Store(time.Now().UnixNano())
 					}
 				}
 				if bitmapEventType != sdl.FIRSTEVENT && eventPending.CompareAndSwap(false, true) {
@@ -1082,6 +1104,19 @@ func mainLoop(hostPort, domain, user, password string, width, height int, swap_a
 
 		if mouseMoved {
 			rdpClient.MouseMove(lastMouseX, lastMouseY)
+		}
+
+		// Update queueDepth congestion hint every loop iteration so the server
+		// reduces H.264 quality while we are dropping frames.  This fires even
+		// when all frames are dropped (yuvDoneCh / yuvCh never fire), which is
+		// the most important case to signal.
+		if dropNs := lastH264DropNs.Load(); dropNs != 0 {
+			if time.Since(time.Unix(0, dropNs)) < h264DropCooldown {
+				rdpClient.SetQueueDepthHint(h264CongestionHint)
+			} else {
+				lastH264DropNs.Store(0)
+				rdpClient.SetQueueDepthHint(0)
+			}
 		}
 
 		// Drain incoming bitmaps and update GPU texture on the main thread.
@@ -1400,8 +1435,8 @@ func main() {
 	// thread, causing subtle crashes or missing events on macOS.
 	runtime.LockOSThread()
 
-	handler := slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelDebug})
-	slog.SetDefault(slog.New(handler))
+	// handler := slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelDebug})
+	// slog.SetDefault(slog.New(handler))
 
 	swap_alt_meta := flag.Bool("swap-alt-meta", false, "swap alt and meta key")
 	flag.Parse()
