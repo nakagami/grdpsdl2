@@ -2,15 +2,28 @@
 
 Microsoft RDP client built with [grdp](https://github.com/nakagami/grdp) and [go-sdl2](https://github.com/veandco/go-sdl2).
 
+## Requirements
+
+Install SDL2 by following the instructions [here](https://github.com/veandco/go-sdl2?tab=readme-ov-file#requirements).
+
+For H.264 hardware-accelerated decoding (recommended), also install FFmpeg:
+
+- **macOS**: `brew install ffmpeg`
+- **Linux**: `apt install libavcodec-dev libavutil-dev libswscale-dev` (or equivalent)
+
 ## Installation
+
+Without H.264 (software rendering only):
 
 ```sh
 go install github.com/nakagami/grdpsdl2@latest
 ```
 
-## Requirements
+With H.264 hardware-accelerated decoding (requires FFmpeg):
 
-Install SDL2 by following the instructions [here](https://github.com/veandco/go-sdl2?tab=readme-ov-file#requirements).
+```sh
+go install -tags h264 github.com/nakagami/grdpsdl2@latest
+```
 
 ## Configuration
 
