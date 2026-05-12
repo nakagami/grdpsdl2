@@ -3,7 +3,7 @@ module github.com/nakagami/grdpsdl2
 go 1.26.3
 
 require (
-	github.com/nakagami/grdp v0.7.30
+	github.com/nakagami/grdp v0.8.0
 	github.com/veandco/go-sdl2 v0.4.40
 )
 
