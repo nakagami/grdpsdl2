@@ -38,10 +38,12 @@ package main
 #cgo noescape grdp_copy_yuv420p_to_i420
 #cgo noescape grdp_copy_nv12_to_i420
 #cgo noescape grdp_copy_nv12
-#cgo noescape grdp_yuv420p_to_bgra
 #cgo noescape grdp_yuv420p_to_bgra_regions
-#cgo noescape grdp_nv12_to_bgra
+#cgo noescape grdp_yuv420p_to_bgra_rows
 #cgo noescape grdp_nv12_to_bgra_regions
+#cgo noescape grdp_nv12_to_bgra_rows
+#cgo nocallback grdp_yuv420p_to_bgra_rows
+#cgo nocallback grdp_nv12_to_bgra_rows
 #cgo noescape grdp_frame_to_bgra
 #cgo noescape grdp_sample_nv12
 #cgo noescape grdp_sample_yuv
@@ -56,6 +58,9 @@ package main
 #include <stdint.h>
 #ifdef __ARM_NEON__
 #include <arm_neon.h>
+#endif
+#ifdef __SSE2__
+#include <emmintrin.h>
 #endif
 
 // grdp_suppress_av_log sets FFmpeg's global log level to FATAL so that
@@ -220,6 +225,69 @@ static inline void grdp_yuv420p_to_bgra_neon_8(
     bgra.val[3] = vdup_n_u8(255);
     vst4_u8(drow + col * 4, bgra);
 }
+
+// grdp_yuv420p_to_bgra_neon_16 processes 16 luma pixels (8 UV pairs) per call.
+// One vld1_u8 covers all 8 U (and V) samples needed for 16 luma columns.
+// vzip_u8 duplicates the low half for pixels 0-7 and the high half for 8-15,
+// giving twice the throughput of grdp_yuv420p_to_bgra_neon_8 per iteration.
+static inline void grdp_yuv420p_to_bgra_neon_16(
+    const uint8_t *yrow, const uint8_t *urow, const uint8_t *vrow,
+    uint8_t *drow, int col,
+    int16_t ky, int16_t kr, int16_t kgu, int16_t kgv, int16_t kb,
+    int16_t yoff)
+{
+    // Load 16 luma bytes, subtract Y offset.
+    uint8x16_t y_u8 = vld1q_u8(yrow + col);
+    int16x8_t c_lo = vsubq_s16(vreinterpretq_s16_u16(vmovl_u8(vget_low_u8(y_u8))),
+                                vdupq_n_s16(yoff));
+    int16x8_t c_hi = vsubq_s16(vreinterpretq_s16_u16(vmovl_u8(vget_high_u8(y_u8))),
+                                vdupq_n_s16(yoff));
+
+    // Load 8 U and 8 V bytes; duplicate each to cover its two luma pixels.
+    uint8x8_t u_raw = vld1_u8(urow + (col >> 1));
+    uint8x8_t v_raw = vld1_u8(vrow + (col >> 1));
+    uint8x8x2_t u_zip = vzip_u8(u_raw, u_raw); // val[0]=[U0,U0,...,U3,U3] val[1]=[U4,U4,...,U7,U7]
+    uint8x8x2_t v_zip = vzip_u8(v_raw, v_raw);
+
+    // Pixels 0-7 (low half).
+    {
+        int16x8_t u8 = vsubq_s16(vreinterpretq_s16_u16(vmovl_u8(u_zip.val[0])), vdupq_n_s16(128));
+        int16x8_t v8 = vsubq_s16(vreinterpretq_s16_u16(vmovl_u8(v_zip.val[0])), vdupq_n_s16(128));
+        int16x4_t cl = vget_low_s16(c_lo),  ul = vget_low_s16(u8),  vl = vget_low_s16(v8);
+        int16x4_t ch = vget_high_s16(c_lo), uh = vget_high_s16(u8), vh = vget_high_s16(v8);
+        int32x4_t kyl = vmull_n_s16(cl, ky), kyh = vmull_n_s16(ch, ky);
+        int32x4_t rl = vaddq_s32(vaddq_s32(kyl, vmull_n_s16(vl, kr)), vdupq_n_s32(128));
+        int32x4_t gl = vaddq_s32(vsubq_s32(vsubq_s32(kyl, vmull_n_s16(ul, kgu)), vmull_n_s16(vl, kgv)), vdupq_n_s32(128));
+        int32x4_t bl = vaddq_s32(vaddq_s32(kyl, vmull_n_s16(ul, kb)),  vdupq_n_s32(128));
+        int32x4_t rh = vaddq_s32(vaddq_s32(kyh, vmull_n_s16(vh, kr)), vdupq_n_s32(128));
+        int32x4_t gh = vaddq_s32(vsubq_s32(vsubq_s32(kyh, vmull_n_s16(uh, kgu)), vmull_n_s16(vh, kgv)), vdupq_n_s32(128));
+        int32x4_t bh = vaddq_s32(vaddq_s32(kyh, vmull_n_s16(uh, kb)),  vdupq_n_s32(128));
+        uint8x8_t r = vqmovun_s16(vcombine_s16(vqmovn_s32(vshrq_n_s32(rl,8)), vqmovn_s32(vshrq_n_s32(rh,8))));
+        uint8x8_t g = vqmovun_s16(vcombine_s16(vqmovn_s32(vshrq_n_s32(gl,8)), vqmovn_s32(vshrq_n_s32(gh,8))));
+        uint8x8_t b = vqmovun_s16(vcombine_s16(vqmovn_s32(vshrq_n_s32(bl,8)), vqmovn_s32(vshrq_n_s32(bh,8))));
+        uint8x8x4_t bgra; bgra.val[0]=b; bgra.val[1]=g; bgra.val[2]=r; bgra.val[3]=vdup_n_u8(255);
+        vst4_u8(drow + col * 4, bgra);
+    }
+    // Pixels 8-15 (high half).
+    {
+        int16x8_t u8 = vsubq_s16(vreinterpretq_s16_u16(vmovl_u8(u_zip.val[1])), vdupq_n_s16(128));
+        int16x8_t v8 = vsubq_s16(vreinterpretq_s16_u16(vmovl_u8(v_zip.val[1])), vdupq_n_s16(128));
+        int16x4_t cl = vget_low_s16(c_hi),  ul = vget_low_s16(u8),  vl = vget_low_s16(v8);
+        int16x4_t ch = vget_high_s16(c_hi), uh = vget_high_s16(u8), vh = vget_high_s16(v8);
+        int32x4_t kyl = vmull_n_s16(cl, ky), kyh = vmull_n_s16(ch, ky);
+        int32x4_t rl = vaddq_s32(vaddq_s32(kyl, vmull_n_s16(vl, kr)), vdupq_n_s32(128));
+        int32x4_t gl = vaddq_s32(vsubq_s32(vsubq_s32(kyl, vmull_n_s16(ul, kgu)), vmull_n_s16(vl, kgv)), vdupq_n_s32(128));
+        int32x4_t bl = vaddq_s32(vaddq_s32(kyl, vmull_n_s16(ul, kb)),  vdupq_n_s32(128));
+        int32x4_t rh = vaddq_s32(vaddq_s32(kyh, vmull_n_s16(vh, kr)), vdupq_n_s32(128));
+        int32x4_t gh = vaddq_s32(vsubq_s32(vsubq_s32(kyh, vmull_n_s16(uh, kgu)), vmull_n_s16(vh, kgv)), vdupq_n_s32(128));
+        int32x4_t bh = vaddq_s32(vaddq_s32(kyh, vmull_n_s16(uh, kb)),  vdupq_n_s32(128));
+        uint8x8_t r = vqmovun_s16(vcombine_s16(vqmovn_s32(vshrq_n_s32(rl,8)), vqmovn_s32(vshrq_n_s32(rh,8))));
+        uint8x8_t g = vqmovun_s16(vcombine_s16(vqmovn_s32(vshrq_n_s32(gl,8)), vqmovn_s32(vshrq_n_s32(gh,8))));
+        uint8x8_t b = vqmovun_s16(vcombine_s16(vqmovn_s32(vshrq_n_s32(bl,8)), vqmovn_s32(vshrq_n_s32(bh,8))));
+        uint8x8x4_t bgra; bgra.val[0]=b; bgra.val[1]=g; bgra.val[2]=r; bgra.val[3]=vdup_n_u8(255);
+        vst4_u8(drow + (col + 8) * 4, bgra);
+    }
+}
 #endif // __ARM_NEON__
 
 static void grdp_yuv420p_to_bgra(
@@ -240,6 +308,9 @@ static void grdp_yuv420p_to_bgra(
         const uint8_t *vrow = src->data[2] + (row >> 1) * src->linesize[2];
         uint8_t *drow = dst + row * dst_stride;
         int col = 0;
+        for (; col + 15 < width; col += 16)
+            grdp_yuv420p_to_bgra_neon_16(yrow, urow, vrow, drow, col,
+                                          ky, kr, kgu, kgv, kb, yoff);
         for (; col + 7 < width; col += 8)
             grdp_yuv420p_to_bgra_neon_8(yrow, urow, vrow, drow, col,
                                         ky, kr, kgu, kgv, kb, yoff);
@@ -301,16 +372,18 @@ static void grdp_yuv420p_to_bgra_regions(
             uint8_t *drow = dst + row * dst_stride;
             int col = left;
 #ifdef __ARM_NEON__
-            // Advance scalar to the next multiple-of-8 boundary before the
-            // NEON loop.  The NEON helper loads 8 luma bytes and 8 UV bytes
-            // starting at col; col must be even for correct NV12 UV pairing.
-            // A multiple of 8 satisfies both that and the 8-pixel alignment.
-            int neon_start = (col + 7) & ~7;
+            // Advance scalar to the next multiple-of-16 boundary before the
+            // NEON loop.  The NEON helpers require col to be a multiple of 16
+            // (or 8 for the 8-pixel fallback) for correct UV pairing.
+            int neon_start = (col + 15) & ~15;
             for (; col < neon_start && col < right; col++) {
                 int u = (int)urow[col >> 1] - 128;
                 int v = (int)vrow[col >> 1] - 128;
                 grdp_bt601_pixel((int)yrow[col], u, v, full_range, drow + col*4);
             }
+            for (; col + 15 < right; col += 16)
+                grdp_yuv420p_to_bgra_neon_16(yrow, urow, vrow, drow, col,
+                                              ky, kr, kgu, kgv, kb, yoff);
             for (; col + 7 < right; col += 8)
                 grdp_yuv420p_to_bgra_neon_8(yrow, urow, vrow, drow, col,
                                              ky, kr, kgu, kgv, kb, yoff);
@@ -381,6 +454,68 @@ static inline void grdp_nv12_to_bgra_neon_8(
     bgra.val[3] = vdup_n_u8(255);
     vst4_u8(drow + col * 4, bgra);
 }
+
+// grdp_nv12_to_bgra_neon_16 processes 16 luma pixels (8 UV pairs) per call.
+// vld2_u8 deinterleaves U and V in one instruction; vzip_u8 then duplicates
+// each chroma sample for the two luma pixels it serves, giving twice the
+// throughput of grdp_nv12_to_bgra_neon_8 per loop iteration.
+static inline void grdp_nv12_to_bgra_neon_16(
+    const uint8_t *yrow, const uint8_t *uvrow, uint8_t *drow,
+    int col, int16_t ky, int16_t kr, int16_t kgu, int16_t kgv, int16_t kb,
+    int16_t yoff)
+{
+    // Load 16 luma bytes, subtract Y offset.
+    uint8x16_t y_u8 = vld1q_u8(yrow + col);
+    int16x8_t c_lo = vsubq_s16(vreinterpretq_s16_u16(vmovl_u8(vget_low_u8(y_u8))),
+                                vdupq_n_s16(yoff));
+    int16x8_t c_hi = vsubq_s16(vreinterpretq_s16_u16(vmovl_u8(vget_high_u8(y_u8))),
+                                vdupq_n_s16(yoff));
+
+    // Load 8 UV pairs (16 bytes) with automatic deinterleave.
+    // val[0]=[U0..U7], val[1]=[V0..V7]; each serves 2 luma pixels.
+    uint8x8x2_t uv = vld2_u8(uvrow + col);
+    uint8x8x2_t u_zip = vzip_u8(uv.val[0], uv.val[0]); // val[0]=[U0,U0,...,U3,U3] val[1]=[U4,U4,...,U7,U7]
+    uint8x8x2_t v_zip = vzip_u8(uv.val[1], uv.val[1]);
+
+    // Pixels 0-7 (low half).
+    {
+        int16x8_t u8 = vsubq_s16(vreinterpretq_s16_u16(vmovl_u8(u_zip.val[0])), vdupq_n_s16(128));
+        int16x8_t v8 = vsubq_s16(vreinterpretq_s16_u16(vmovl_u8(v_zip.val[0])), vdupq_n_s16(128));
+        int16x4_t cl = vget_low_s16(c_lo),  ul = vget_low_s16(u8),  vl = vget_low_s16(v8);
+        int16x4_t ch = vget_high_s16(c_lo), uh = vget_high_s16(u8), vh = vget_high_s16(v8);
+        int32x4_t kyl = vmull_n_s16(cl, ky), kyh = vmull_n_s16(ch, ky);
+        int32x4_t rl = vaddq_s32(vaddq_s32(kyl, vmull_n_s16(vl, kr)), vdupq_n_s32(128));
+        int32x4_t gl = vaddq_s32(vsubq_s32(vsubq_s32(kyl, vmull_n_s16(ul, kgu)), vmull_n_s16(vl, kgv)), vdupq_n_s32(128));
+        int32x4_t bl = vaddq_s32(vaddq_s32(kyl, vmull_n_s16(ul, kb)),  vdupq_n_s32(128));
+        int32x4_t rh = vaddq_s32(vaddq_s32(kyh, vmull_n_s16(vh, kr)), vdupq_n_s32(128));
+        int32x4_t gh = vaddq_s32(vsubq_s32(vsubq_s32(kyh, vmull_n_s16(uh, kgu)), vmull_n_s16(vh, kgv)), vdupq_n_s32(128));
+        int32x4_t bh = vaddq_s32(vaddq_s32(kyh, vmull_n_s16(uh, kb)),  vdupq_n_s32(128));
+        uint8x8_t r = vqmovun_s16(vcombine_s16(vqmovn_s32(vshrq_n_s32(rl,8)), vqmovn_s32(vshrq_n_s32(rh,8))));
+        uint8x8_t g = vqmovun_s16(vcombine_s16(vqmovn_s32(vshrq_n_s32(gl,8)), vqmovn_s32(vshrq_n_s32(gh,8))));
+        uint8x8_t b = vqmovun_s16(vcombine_s16(vqmovn_s32(vshrq_n_s32(bl,8)), vqmovn_s32(vshrq_n_s32(bh,8))));
+        uint8x8x4_t bgra; bgra.val[0]=b; bgra.val[1]=g; bgra.val[2]=r; bgra.val[3]=vdup_n_u8(255);
+        vst4_u8(drow + col * 4, bgra);
+    }
+    // Pixels 8-15 (high half).
+    {
+        int16x8_t u8 = vsubq_s16(vreinterpretq_s16_u16(vmovl_u8(u_zip.val[1])), vdupq_n_s16(128));
+        int16x8_t v8 = vsubq_s16(vreinterpretq_s16_u16(vmovl_u8(v_zip.val[1])), vdupq_n_s16(128));
+        int16x4_t cl = vget_low_s16(c_hi),  ul = vget_low_s16(u8),  vl = vget_low_s16(v8);
+        int16x4_t ch = vget_high_s16(c_hi), uh = vget_high_s16(u8), vh = vget_high_s16(v8);
+        int32x4_t kyl = vmull_n_s16(cl, ky), kyh = vmull_n_s16(ch, ky);
+        int32x4_t rl = vaddq_s32(vaddq_s32(kyl, vmull_n_s16(vl, kr)), vdupq_n_s32(128));
+        int32x4_t gl = vaddq_s32(vsubq_s32(vsubq_s32(kyl, vmull_n_s16(ul, kgu)), vmull_n_s16(vl, kgv)), vdupq_n_s32(128));
+        int32x4_t bl = vaddq_s32(vaddq_s32(kyl, vmull_n_s16(ul, kb)),  vdupq_n_s32(128));
+        int32x4_t rh = vaddq_s32(vaddq_s32(kyh, vmull_n_s16(vh, kr)), vdupq_n_s32(128));
+        int32x4_t gh = vaddq_s32(vsubq_s32(vsubq_s32(kyh, vmull_n_s16(uh, kgu)), vmull_n_s16(vh, kgv)), vdupq_n_s32(128));
+        int32x4_t bh = vaddq_s32(vaddq_s32(kyh, vmull_n_s16(uh, kb)),  vdupq_n_s32(128));
+        uint8x8_t r = vqmovun_s16(vcombine_s16(vqmovn_s32(vshrq_n_s32(rl,8)), vqmovn_s32(vshrq_n_s32(rh,8))));
+        uint8x8_t g = vqmovun_s16(vcombine_s16(vqmovn_s32(vshrq_n_s32(gl,8)), vqmovn_s32(vshrq_n_s32(gh,8))));
+        uint8x8_t b = vqmovun_s16(vcombine_s16(vqmovn_s32(vshrq_n_s32(bl,8)), vqmovn_s32(vshrq_n_s32(bh,8))));
+        uint8x8x4_t bgra; bgra.val[0]=b; bgra.val[1]=g; bgra.val[2]=r; bgra.val[3]=vdup_n_u8(255);
+        vst4_u8(drow + (col + 8) * 4, bgra);
+    }
+}
 #endif // __ARM_NEON__
 
 static void grdp_nv12_to_bgra(
@@ -401,6 +536,8 @@ static void grdp_nv12_to_bgra(
         const uint8_t *uvrow = src->data[1] + (row >> 1) * src->linesize[1];
         uint8_t *drow = dst + row * dst_stride;
         int col = 0;
+        for (; col + 15 < width; col += 16)
+            grdp_nv12_to_bgra_neon_16(yrow, uvrow, drow, col, ky, kr, kgu, kgv, kb, yoff);
         for (; col + 7 < width; col += 8)
             grdp_nv12_to_bgra_neon_8(yrow, uvrow, drow, col, ky, kr, kgu, kgv, kb, yoff);
         // Scalar tail for widths not a multiple of 8.
@@ -457,12 +594,14 @@ static void grdp_nv12_to_bgra_regions(
             uint8_t *drow = dst + row * dst_stride;
             int col = left;
 #ifdef __ARM_NEON__
-            int neon_start = (col + 7) & ~7;
+            int neon_start = (col + 15) & ~15;
             for (; col < neon_start && col < right; col++) {
                 int u = (int)uvrow[(col >> 1) * 2    ] - 128;
                 int v = (int)uvrow[(col >> 1) * 2 + 1] - 128;
                 grdp_bt601_pixel((int)yrow[col], u, v, full_range, drow + col*4);
             }
+            for (; col + 15 < right; col += 16)
+                grdp_nv12_to_bgra_neon_16(yrow, uvrow, drow, col, ky, kr, kgu, kgv, kb, yoff);
             for (; col + 7 < right; col += 8)
                 grdp_nv12_to_bgra_neon_8(yrow, uvrow, drow, col, ky, kr, kgu, kgv, kb, yoff);
 #endif
@@ -587,6 +726,17 @@ static void grdp_copy_nv12_to_i420(
             vst1q_u8(ud + x, uv.val[0]);
             vst1q_u8(vd + x, uv.val[1]);
         }
+#elif defined(__SSE2__)
+        // SSE2: deinterleave 8 UV pairs (16 bytes) per iteration.
+        // _mm_and_si128 extracts even bytes (U) and _mm_srli_epi16 shifts odd bytes (V).
+        // _mm_packus_epi16 packs 8 × 16-bit values to 8 bytes in the low half.
+        for (; x + 7 < pw; x += 8) {
+            __m128i uv128 = _mm_loadu_si128((const __m128i *)(row + x * 2));
+            __m128i u_vec = _mm_and_si128(uv128, _mm_set1_epi16(0x00FF));
+            __m128i v_vec = _mm_srli_epi16(uv128, 8);
+            _mm_storel_epi64((__m128i *)(ud + x), _mm_packus_epi16(u_vec, u_vec));
+            _mm_storel_epi64((__m128i *)(vd + x), _mm_packus_epi16(v_vec, v_vec));
+        }
 #endif
         for (; x < pw; x++) {
             ud[x] = row[x * 2];
@@ -620,6 +770,100 @@ static void grdp_copy_nv12(
             memcpy(uvdst + y * uv_bytes, f->data[1] + y * f->linesize[1], uv_bytes);
 }
 
+// grdp_nv12_to_bgra_rows is the row-range variant of grdp_nv12_to_bgra.
+// Only rows [start_row, end_row) are written; the rest of dst is untouched.
+// This allows the caller to parallelise the conversion across goroutines.
+static void grdp_nv12_to_bgra_rows(
+    const AVFrame *src, uint8_t *dst, int dst_stride, int full_range,
+    int start_row, int end_row)
+{
+    int width = src->width;
+    if (start_row < 0) start_row = 0;
+    if (end_row > src->height) end_row = src->height;
+#ifdef __ARM_NEON__
+    int16_t ky  = full_range ? 256 : 298;
+    int16_t kr  = full_range ? 359 : 409;
+    int16_t kgu = full_range ?  88 : 100;
+    int16_t kgv = full_range ? 183 : 208;
+    int16_t kb  = full_range ? 454 : 516;
+    int16_t yoff = full_range ? 0 : 16;
+    for (int row = start_row; row < end_row; row++) {
+        const uint8_t *yrow  = src->data[0] + row        * src->linesize[0];
+        const uint8_t *uvrow = src->data[1] + (row >> 1) * src->linesize[1];
+        uint8_t *drow = dst + row * dst_stride;
+        int col = 0;
+        for (; col + 15 < width; col += 16)
+            grdp_nv12_to_bgra_neon_16(yrow, uvrow, drow, col, ky, kr, kgu, kgv, kb, yoff);
+        for (; col + 7 < width; col += 8)
+            grdp_nv12_to_bgra_neon_8(yrow, uvrow, drow, col, ky, kr, kgu, kgv, kb, yoff);
+        for (; col < width; col++) {
+            int u = (int)uvrow[(col >> 1) * 2    ] - 128;
+            int v = (int)uvrow[(col >> 1) * 2 + 1] - 128;
+            grdp_bt601_pixel((int)yrow[col], u, v, full_range, drow + col*4);
+        }
+    }
+#else
+    for (int row = start_row; row < end_row; row++) {
+        const uint8_t *yrow  = src->data[0] + row        * src->linesize[0];
+        const uint8_t *uvrow = src->data[1] + (row >> 1) * src->linesize[1];
+        uint8_t *drow = dst + row * dst_stride;
+        for (int col = 0; col < width; col++) {
+            int u = (int)uvrow[(col >> 1) * 2    ] - 128;
+            int v = (int)uvrow[(col >> 1) * 2 + 1] - 128;
+            grdp_bt601_pixel((int)yrow[col], u, v, full_range, drow + col*4);
+        }
+    }
+#endif
+}
+
+// grdp_yuv420p_to_bgra_rows is the row-range variant of grdp_yuv420p_to_bgra.
+static void grdp_yuv420p_to_bgra_rows(
+    const AVFrame *src, uint8_t *dst, int dst_stride, int full_range,
+    int start_row, int end_row)
+{
+    int width = src->width;
+    if (start_row < 0) start_row = 0;
+    if (end_row > src->height) end_row = src->height;
+#ifdef __ARM_NEON__
+    int16_t ky   = full_range ? 256 : 298;
+    int16_t kr   = full_range ? 359 : 409;
+    int16_t kgu  = full_range ?  88 : 100;
+    int16_t kgv  = full_range ? 183 : 208;
+    int16_t kb   = full_range ? 454 : 516;
+    int16_t yoff = full_range ?   0 :  16;
+    for (int row = start_row; row < end_row; row++) {
+        const uint8_t *yrow = src->data[0] + row        * src->linesize[0];
+        const uint8_t *urow = src->data[1] + (row >> 1) * src->linesize[1];
+        const uint8_t *vrow = src->data[2] + (row >> 1) * src->linesize[2];
+        uint8_t *drow = dst + row * dst_stride;
+        int col = 0;
+        for (; col + 15 < width; col += 16)
+            grdp_yuv420p_to_bgra_neon_16(yrow, urow, vrow, drow, col,
+                                          ky, kr, kgu, kgv, kb, yoff);
+        for (; col + 7 < width; col += 8)
+            grdp_yuv420p_to_bgra_neon_8(yrow, urow, vrow, drow, col,
+                                        ky, kr, kgu, kgv, kb, yoff);
+        for (; col < width; col++) {
+            int u = (int)urow[col >> 1] - 128;
+            int v = (int)vrow[col >> 1] - 128;
+            grdp_bt601_pixel((int)yrow[col], u, v, full_range, drow + col*4);
+        }
+    }
+#else
+    for (int row = start_row; row < end_row; row++) {
+        const uint8_t *yrow = src->data[0] + row        * src->linesize[0];
+        const uint8_t *urow = src->data[1] + (row >> 1) * src->linesize[1];
+        const uint8_t *vrow = src->data[2] + (row >> 1) * src->linesize[2];
+        uint8_t *drow = dst + row * dst_stride;
+        for (int col = 0; col < width; col++) {
+            int u = (int)urow[col >> 1] - 128;
+            int v = (int)vrow[col >> 1] - 128;
+            grdp_bt601_pixel((int)yrow[col], u, v, full_range, drow + col*4);
+        }
+    }
+#endif
+}
+
 // grdp_find_v4l2m2m returns the h264_v4l2m2m decoder if FFmpeg was compiled
 // with V4L2 M2M support (common on Linux/Raspberry Pi). Returns NULL otherwise.
 static const AVCodec *grdp_find_v4l2m2m(void) {
@@ -646,6 +890,46 @@ import (
 // producing a strong green cast; the hand-written BT.601 loops are used instead.
 // On x86_64, swscale is both correct and significantly faster (SSSE3/AVX2).
 var useSwscale = runtime.GOARCH != "arm64"
+
+// convertWorkers is the number of goroutines used to parallelise the YUV→BGRA
+// conversion.  Capped at 4 so we don't thrash the cache with too many threads
+// writing into the same output buffer.
+var convertWorkers = min(runtime.GOMAXPROCS(0), 4)
+
+// convertParallelMinH is the minimum frame height at which row-parallel
+// conversion is enabled.  For small frames the goroutine overhead outweighs
+// the gain from parallelism.
+const convertParallelMinH = 480
+
+// parallelConvertRows partitions [0, h) into convertWorkers equal bands and
+// calls fn(startRow, endRow) concurrently via goroutines.  For small frames
+// (h < convertParallelMinH) or when convertWorkers <= 1 the function is called
+// serially to avoid goroutine overhead.
+func parallelConvertRows(h int, fn func(s, e C.int)) {
+	n := convertWorkers
+	if n <= 1 || h < convertParallelMinH {
+		fn(0, C.int(h))
+		return
+	}
+	var wg sync.WaitGroup
+	step := (h + n - 1) / n
+	for i := 0; i < n; i++ {
+		s := i * step
+		e := s + step
+		if e > h {
+			e = h
+		}
+		if s >= h {
+			break
+		}
+		wg.Add(1)
+		go func(s, e int) {
+			defer wg.Done()
+			fn(C.int(s), C.int(e))
+		}(s, e)
+	}
+	wg.Wait()
+}
 
 // avLogOnce ensures grdp_suppress_av_log is called only once per process.
 var avLogOnce sync.Once
@@ -1852,8 +2136,10 @@ func (d *ffmpegDecoder) convertFrame(regionHint []C.uint16_t, nRegions C.int) (*
 				(*C.uint8_t)(unsafe.Pointer(&out[0])), C.int(w*4), fullRange,
 				(*C.uint16_t)(unsafe.Pointer(&regionHint[0])), nRegions)
 		} else {
-			C.grdp_yuv420p_to_bgra(srcFrame,
-				(*C.uint8_t)(unsafe.Pointer(&out[0])), C.int(w*4), fullRange)
+			dstPtr := (*C.uint8_t)(unsafe.Pointer(&out[0]))
+			parallelConvertRows(int(h), func(s, e C.int) {
+				C.grdp_yuv420p_to_bgra_rows(srcFrame, dstPtr, C.int(w*4), fullRange, s, e)
+			})
 		}
 
 	case srcFmt == C.AV_PIX_FMT_NV12 && !useSwscale:
@@ -1910,8 +2196,10 @@ func (d *ffmpegDecoder) convertFrame(regionHint []C.uint16_t, nRegions C.int) (*
 				(*C.uint8_t)(unsafe.Pointer(&out[0])), C.int(w*4), fullRange,
 				(*C.uint16_t)(unsafe.Pointer(&regionHint[0])), nRegions)
 		} else {
-			C.grdp_nv12_to_bgra(srcFrame,
-				(*C.uint8_t)(unsafe.Pointer(&out[0])), C.int(w*4), fullRange)
+			dstPtr := (*C.uint8_t)(unsafe.Pointer(&out[0]))
+			parallelConvertRows(int(h), func(s, e C.int) {
+				C.grdp_nv12_to_bgra_rows(srcFrame, dstPtr, C.int(w*4), fullRange, s, e)
+			})
 		}
 		if logThis {
 			// Sample NV12 input and BGRA output at multiple positions for
