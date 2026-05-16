@@ -532,6 +532,7 @@ func mainLoop(hostPort, domain, user, password string, width, height int, swap_a
 	bitmapCh := make(chan []grdp.Bitmap, 32)
 	yuvCh := make(chan yuvFrame, 4) // fallback path only (used when pre-lock unavailable)
 	yuvReady := false               // true once any H264 frame has been rendered
+	yuvTextureIsNull := false       // true when the last uploaded frame was null (Y=0,UV=0=green); skip Copy
 	clipboardFromServer := make(chan string, 4)
 	clipboardReqCh := make(chan chan string, 1)
 
@@ -1052,6 +1053,7 @@ func mainLoop(hostPort, domain, user, password string, width, height int, swap_a
 			}
 		}
 		yuvReady = false
+		yuvTextureIsNull = false
 		ap.reopenNeeded.Store(false)
 		ap.reset()
 	}
@@ -1172,6 +1174,9 @@ func mainLoop(hostPort, domain, user, password string, width, height int, swap_a
 					// unlocked above to keep the pipeline moving, but not rendered —
 					// showing them would flash green for one display frame.
 					yuvReady = true
+					yuvTextureIsNull = false
+				} else {
+					yuvTextureIsNull = true
 				}
 			default:
 			}
@@ -1198,12 +1203,14 @@ func mainLoop(hostPort, domain, user, password string, width, height int, swap_a
 					// Null frame (Y=0,UV=0): discard — uploading green data would flash
 					// through non-bitmap areas.  Keep the previous real frame visible.
 					yuvBufPool.Put(latestYUV.buf)
+					yuvTextureIsNull = true
 				} else {
 					clearOverlayDirty()
 					rect := sdl.Rect{X: int32(latestYUV.destX), Y: int32(latestYUV.destY), W: int32(latestYUV.w), H: int32(latestYUV.h)}
 					uploadYUVFrame(latestYUV, yuvTexture, &rect)
 					yuvBufPool.Put(latestYUV.buf)
 					yuvReady = true
+					yuvTextureIsNull = false
 				}
 			}
 		}
@@ -1224,7 +1231,11 @@ func mainLoop(hostPort, domain, user, password string, width, height int, swap_a
 		// when no new data arrives (e.g. video stall, idle desktop).  SDL2's
 		// double-buffering requires re-copying every frame; skipping Copy on
 		// non-dirty frames causes the empty backbuffer to flash through.
-		if yuvReady {
+		// Clear to black first so the uninitialized renderer background (which
+		// shows through the initially-transparent BGRA overlay) is not visible.
+		renderer.SetDrawColor(0, 0, 0, 255)
+		renderer.Clear()
+		if yuvReady && !yuvTextureIsNull {
 			renderer.Copy(yuvTexture, nil, nil)
 		}
 		renderer.Copy(texture, nil, nil)
