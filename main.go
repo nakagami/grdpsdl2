@@ -1273,18 +1273,18 @@ func mainLoop(hostPort, domain, user, password string, width, height int, swap_a
 		if lastNS != 0 && !resizePending {
 			elapsed := time.Since(time.Unix(0, lastNS))
 			if elapsed > videoStallTimeout {
-				slog.Warn("Video stalled, reconnecting to recover",
+				slog.Warn("Video stalled (reconnect disabled for testing)",
 					"stalled", elapsed.Round(time.Millisecond))
-				lastServerActivity.Store(time.Now().UnixNano()) // prevent repeated reconnects while Reconnect runs
-				curW, curH := window.GetSize()
-				reconnecting.Store(1)
-				reconnErr := rdpClient.Reconnect(int(curW), int(curH))
-				reconnecting.Store(0)
-				if reconnErr != nil {
-					slog.Error("Video stall reconnect failed", "err", reconnErr)
-				} else {
-					resetAfterReconnect(curW, curH)
-				}
+				lastServerActivity.Store(time.Now().UnixNano()) // reset to avoid repeated log spam
+				// curW, curH := window.GetSize()
+				// reconnecting.Store(1)
+				// reconnErr := rdpClient.Reconnect(int(curW), int(curH))
+				// reconnecting.Store(0)
+				// if reconnErr != nil {
+				// 	slog.Error("Video stall reconnect failed", "err", reconnErr)
+				// } else {
+				// 	resetAfterReconnect(curW, curH)
+				// }
 			}
 		}
 		// Audio device recovery: play() sets reopenNeeded when SDL2 reports
