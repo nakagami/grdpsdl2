@@ -396,6 +396,10 @@ func mainLoop(hostPort, domain, user, password string, width, height int, swap_a
 	// connection.  1 = reconnect in progress, 0 = normal operation.
 	var reconnecting atomic.Int32
 
+	// decoderBrokenPending is set by the OnDecoderBroken callback to signal
+	// the main loop that a reconnect is needed to recover the H.264 stream.
+	var decoderBrokenPending atomic.Bool
+
 	// eventPending prevents redundant SDL user-event pushes when H.264 or
 	// bitmap callbacks fire faster than the main loop drains them.  Using
 	// CompareAndSwap ensures at most one pending wake-up event sits in the
@@ -798,7 +802,13 @@ func mainLoop(hostPort, domain, user, password string, width, height int, swap_a
 			slog.Error("Failed to create cursor")
 		}
 	}).OnDecoderBroken(func() {
-		slog.Warn("decoder broken")
+		slog.Warn("decoder broken, scheduling reconnect")
+		decoderBrokenPending.Store(true)
+		// Wake the main loop so it handles the reconnect without waiting for
+		// the next WaitEventTimeout tick.
+		if bitmapEventType != sdl.FIRSTEVENT && eventPending.CompareAndSwap(false, true) {
+			sdl.PushEvent(wakeEvent)
+		}
 	})
 
 	if yuvTexture != nil {
@@ -1124,7 +1134,6 @@ func mainLoop(hostPort, domain, user, password string, width, height int, swap_a
 		// Drain incoming bitmaps and update GPU texture on the main thread.
 		// Clear the event-pending flag first so the next callback push is not suppressed.
 		eventPending.Store(false)
-		dirty := false
 
 		// Process H.264 YUV frames.
 		if yuvPrimaryPath {
@@ -1163,7 +1172,6 @@ func mainLoop(hostPort, domain, user, password string, width, height int, swap_a
 					// unlocked above to keep the pipeline moving, but not rendered —
 					// showing them would flash green for one display frame.
 					yuvReady = true
-					dirty = true
 				}
 			default:
 			}
@@ -1196,7 +1204,6 @@ func mainLoop(hostPort, domain, user, password string, width, height int, swap_a
 					uploadYUVFrame(latestYUV, yuvTexture, &rect)
 					yuvBufPool.Put(latestYUV.buf)
 					yuvReady = true
-					dirty = true
 				}
 			}
 		}
@@ -1209,20 +1216,19 @@ func mainLoop(hostPort, domain, user, password string, width, height int, swap_a
 				for i := range bs {
 					bitmapBufPool.Put(bs[i].Data)
 				}
-				dirty = true
 			default:
 				break drain
 			}
 		}
-		if dirty {
-			if yuvReady {
-				// H264 session: render IYUV base first, then overlay patches on top.
-				renderer.Copy(yuvTexture, nil, nil)
-			}
-			// Always render the overlay (non-H264 bitmaps, or full content when yuvReady=false).
-			renderer.Copy(texture, nil, nil)
-			renderer.Present()
+		// Always copy textures and present so the last frame stays visible even
+		// when no new data arrives (e.g. video stall, idle desktop).  SDL2's
+		// double-buffering requires re-copying every frame; skipping Copy on
+		// non-dirty frames causes the empty backbuffer to flash through.
+		if yuvReady {
+			renderer.Copy(yuvTexture, nil, nil)
 		}
+		renderer.Copy(texture, nil, nil)
+		renderer.Present()
 
 		// Handle clipboard from server (server → client)
 		select {
@@ -1264,29 +1270,30 @@ func mainLoop(hostPort, domain, user, password string, width, height int, swap_a
 			}
 		}
 
-		// Video watchdog: if no traffic of any kind arrives from the server
-		// for a long time after the session was active, the H.264 decoder
-		// may be stuck (e.g. after an HW→SW fallback where the server never
-		// resends an IDR).  Reconnect to reset the decoder and recover the
-		// stream.  We track all server-originated activity (bitmaps,
-		// pointer updates, audio, clipboard) so that an idle desktop with
-		// nothing to redraw does not trigger a false-positive reconnect.
+		// Decoder-broken recovery: when the H.264 decoder declares itself
+		// unrecoverable the OnDecoderBroken callback sets this flag.  Reconnect
+		// here on the main thread (SDL/Core Audio require it) to reset the
+		// decoder and resume video.
+		if decoderBrokenPending.CompareAndSwap(true, false) && !resizePending {
+			slog.Info("Reconnecting after decoder broken")
+			curW, curH := window.GetSize()
+			reconnecting.Store(1)
+			reconnErr := rdpClient.Reconnect(int(curW), int(curH))
+			reconnecting.Store(0)
+			if reconnErr != nil {
+				slog.Error("Decoder-broken reconnect failed", "err", reconnErr)
+			} else {
+				resetAfterReconnect(curW, curH)
+			}
+		}
+
+		// Video watchdog: log when no server activity arrives for a while.
 		lastNS := lastServerActivity.Load()
 		if lastNS != 0 && !resizePending {
 			elapsed := time.Since(time.Unix(0, lastNS))
 			if elapsed > videoStallTimeout {
-				slog.Warn("Video stalled (reconnect disabled for testing)",
-					"stalled", elapsed.Round(time.Millisecond))
+				slog.Warn("Video stalled", "stalled", elapsed.Round(time.Millisecond))
 				lastServerActivity.Store(time.Now().UnixNano()) // reset to avoid repeated log spam
-				// curW, curH := window.GetSize()
-				// reconnecting.Store(1)
-				// reconnErr := rdpClient.Reconnect(int(curW), int(curH))
-				// reconnecting.Store(0)
-				// if reconnErr != nil {
-				// 	slog.Error("Video stall reconnect failed", "err", reconnErr)
-				// } else {
-				// 	resetAfterReconnect(curW, curH)
-				// }
 			}
 		}
 		// Audio device recovery: play() sets reopenNeeded when SDL2 reports
