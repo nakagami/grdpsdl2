@@ -797,6 +797,8 @@ func mainLoop(hostPort, domain, user, password string, width, height int, swap_a
 		} else {
 			slog.Error("Failed to create cursor")
 		}
+	}).OnDecoderBroken(func() {
+		slog.Warn("decoder broken")
 	})
 
 	if yuvTexture != nil {
