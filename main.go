@@ -396,10 +396,6 @@ func mainLoop(hostPort, domain, user, password string, width, height int, swap_a
 	// connection.  1 = reconnect in progress, 0 = normal operation.
 	var reconnecting atomic.Int32
 
-	// decoderBrokenPending is set by the OnDecoderBroken callback to signal
-	// the main loop that a reconnect is needed to recover the H.264 stream.
-	var decoderBrokenPending atomic.Bool
-
 	// eventPending prevents redundant SDL user-event pushes when H.264 or
 	// bitmap callbacks fire faster than the main loop drains them.  Using
 	// CompareAndSwap ensures at most one pending wake-up event sits in the
@@ -803,13 +799,10 @@ func mainLoop(hostPort, domain, user, password string, width, height int, swap_a
 			slog.Error("Failed to create cursor")
 		}
 	}).OnDecoderBroken(func() {
-		slog.Warn("decoder broken, scheduling reconnect")
-		decoderBrokenPending.Store(true)
-		// Wake the main loop so it handles the reconnect without waiting for
-		// the next WaitEventTimeout tick.
-		if bitmapEventType != sdl.FIRSTEVENT && eventPending.CompareAndSwap(false, true) {
-			sdl.PushEvent(wakeEvent)
-		}
+		// HW decoder stalls are handled internally (SW fallback + keyframe
+		// requests); a full TCP reconnect is not needed and would cause a
+		// visible freeze.  Reconnect only on window resize.
+		slog.Warn("decoder broken (no reconnect; relying on internal recovery)")
 	})
 
 	if yuvTexture != nil {
@@ -1281,23 +1274,6 @@ func mainLoop(hostPort, domain, user, password string, width, height int, swap_a
 			}
 		}
 
-		// Decoder-broken recovery: when the H.264 decoder declares itself
-		// unrecoverable the OnDecoderBroken callback sets this flag.  Reconnect
-		// here on the main thread (SDL/Core Audio require it) to reset the
-		// decoder and resume video.
-		if decoderBrokenPending.CompareAndSwap(true, false) && !resizePending {
-			slog.Info("Reconnecting after decoder broken")
-			curW, curH := window.GetSize()
-			reconnecting.Store(1)
-			reconnErr := rdpClient.Reconnect(int(curW), int(curH))
-			reconnecting.Store(0)
-			if reconnErr != nil {
-				slog.Error("Decoder-broken reconnect failed", "err", reconnErr)
-			} else {
-				resetAfterReconnect(curW, curH)
-			}
-		}
-
 		// Video watchdog: log when no server activity arrives for a while.
 		lastNS := lastServerActivity.Load()
 		if lastNS != 0 && !resizePending {
@@ -1451,8 +1427,8 @@ func main() {
 	// thread, causing subtle crashes or missing events on macOS.
 	runtime.LockOSThread()
 
-	// handler := slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelDebug})
-	// slog.SetDefault(slog.New(handler))
+	handler := slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelDebug})
+	slog.SetDefault(slog.New(handler))
 
 	swap_alt_meta := flag.Bool("swap-alt-meta", false, "swap alt and meta key")
 	flag.Parse()
