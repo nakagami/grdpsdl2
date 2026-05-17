@@ -2051,6 +2051,25 @@ func (d *ffmpegDecoder) convertFrame(regionHint []C.uint16_t, nRegions C.int) (*
 	// hardware-decoded H.264 frames as NV12, so keeping the interleaved UV plane
 	// intact avoids the chroma deinterleave required by I420.
 	if d.outNV12Enabled && srcFmt == C.AV_PIX_FMT_NV12 {
+		// Apply the same zero-filled IOSurface check as the BGRA NV12 path
+		// (see comment near hwNeedsZeroCheck below).  The NV12 fast path
+		// previously bypassed this check, allowing zero UV (→ green) frames to
+		// reach the NV12 callback.
+		if d.useHW && d.hwNeedsZeroCheck {
+			var sy, su, sv C.uint8_t
+			C.grdp_sample_nv12(srcFrame, &sy, &su, &sv)
+			if su == 0 && sv == 0 {
+				slog.Debug("H.264: dropping zero-filled HW frame in NV12 path (IOSurface not ready)",
+					"Y", int(sy))
+				if usedMapFrame {
+					C.av_frame_unref(d.mapFrame)
+				} else if srcFrame == d.swFrame {
+					C.av_frame_unref(d.swFrame)
+				}
+				return &rdpgfx.H264Frame{Dropped: true, Width: int(w), Height: int(h)}, transferNs, nil
+			}
+			d.hwNeedsZeroCheck = false
+		}
 		d.extractNV12fromSrc(srcFrame)
 		if usedMapFrame {
 			C.av_frame_unref(d.mapFrame)
@@ -2072,6 +2091,33 @@ func (d *ffmpegDecoder) convertFrame(regionHint []C.uint16_t, nRegions C.int) (*
 	if d.outI420Enabled {
 		if srcFmt == C.AV_PIX_FMT_YUV420P || srcFmt == C.AV_PIX_FMT_YUVJ420P ||
 			srcFmt == C.AV_PIX_FMT_NV12 {
+			// Apply the zero-filled IOSurface check before extracting I420.
+			// The I420 fast path previously bypassed hwNeedsZeroCheck entirely:
+			// VT could output Y≠0, UV=0 (partially initialised IOSurface) which
+			// isNullYUVFrame would not catch (only Y=0 && UV=0 triggers it),
+			// causing a bright-green frame.  Additionally, even an all-zero
+			// frame (Y=0, UV=0) would poison the AVC444 Y cache via
+			// updateAVC444YCache(), producing green LC=2 combine artifacts for
+			// the next 500 ms window.  Check UV here and drop the frame if zero,
+			// matching the BGRA NV12 path behaviour.
+			if srcFmt == C.AV_PIX_FMT_NV12 && d.useHW && d.hwNeedsZeroCheck {
+				var sy, su, sv C.uint8_t
+				C.grdp_sample_nv12(srcFrame, &sy, &su, &sv)
+				if su == 0 && sv == 0 {
+					slog.Debug("H.264: dropping zero-filled HW frame in I420 path (IOSurface not ready)",
+						"Y", int(sy))
+					if usedMapFrame {
+						C.av_frame_unref(d.mapFrame)
+					} else if srcFrame == d.swFrame {
+						C.av_frame_unref(d.swFrame)
+					}
+					// Return Dropped so Decode() counts this as success (health
+					// tracking stays correct) while signalling grdp to skip the
+					// I420 callback and Y-cache update.
+					return &rdpgfx.H264Frame{Dropped: true, Width: int(w), Height: int(h)}, transferNs, nil
+				}
+				d.hwNeedsZeroCheck = false
+			}
 			d.extractI420fromSrc(srcFrame)
 			if usedMapFrame {
 				C.av_frame_unref(d.mapFrame)
