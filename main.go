@@ -396,6 +396,11 @@ func mainLoop(hostPort, domain, user, password string, width, height int, swap_a
 	// connection.  1 = reconnect in progress, 0 = normal operation.
 	var reconnecting atomic.Int32
 
+	// decoderBrokenPending is set by OnDecoderBroken and cleared after the
+	// main loop triggers a reconnect.  Using an atomic avoids locking across
+	// the callback/main-loop boundary.
+	var decoderBrokenPending atomic.Bool
+
 	// eventPending prevents redundant SDL user-event pushes when H.264 or
 	// bitmap callbacks fire faster than the main loop drains them.  Using
 	// CompareAndSwap ensures at most one pending wake-up event sits in the
@@ -799,10 +804,14 @@ func mainLoop(hostPort, domain, user, password string, width, height int, swap_a
 			slog.Error("Failed to create cursor")
 		}
 	}).OnDecoderBroken(func() {
-		// HW decoder stalls are handled internally (SW fallback + keyframe
-		// requests); a full TCP reconnect is not needed and would cause a
-		// visible freeze.  Reconnect only on window resize.
-		slog.Warn("decoder broken (no reconnect; relying on internal recovery)")
+		// All internal recovery attempts (SW fallback + keyframe requests) have
+		// been exhausted.  The server will not send a new IDR without a full
+		// reconnect; trigger one so the session can resume.
+		slog.Warn("decoder broken; scheduling reconnect")
+		decoderBrokenPending.Store(true)
+		if bitmapEventType != sdl.FIRSTEVENT && eventPending.CompareAndSwap(false, true) {
+			sdl.PushEvent(&sdl.UserEvent{Type: bitmapEventType})
+		}
 	})
 
 	if yuvTexture != nil {
@@ -1271,6 +1280,19 @@ func mainLoop(hostPort, domain, user, password string, width, height int, swap_a
 				slog.Error("Reconnect failed", "err", reconnErr)
 			} else {
 				resetAfterReconnect(resizeW, resizeH)
+			}
+		}
+
+		if decoderBrokenPending.CompareAndSwap(true, false) && !resizePending {
+			w, h := window.GetSize()
+			slog.Info("Decoder broken, reconnecting", "width", w, "height", h)
+			reconnecting.Store(1)
+			reconnErr := rdpClient.Reconnect(int(w), int(h))
+			reconnecting.Store(0)
+			if reconnErr != nil {
+				slog.Error("Reconnect (decoder broken) failed", "err", reconnErr)
+			} else {
+				resetAfterReconnect(w, h)
 			}
 		}
 
