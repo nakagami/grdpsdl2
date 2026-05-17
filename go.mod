@@ -12,4 +12,4 @@ require (
 	golang.org/x/crypto v0.0.0-20220622213112-05595931fe9d // indirect
 )
 
-replace github.com/nakagami/grdp => /Users/nakagami/grdp
+// replace github.com/nakagami/grdp => /Users/nakagami/grdp
