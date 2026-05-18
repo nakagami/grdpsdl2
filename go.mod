@@ -13,3 +13,4 @@ require (
 )
 
 // replace github.com/nakagami/grdp => /Users/nakagami/grdp
+replace github.com/nakagami/grdp => /Users/nakagami/grdp

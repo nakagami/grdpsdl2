@@ -1030,14 +1030,11 @@ const keyframeWaitTimeout = 15 * time.Second
 const keyframeWaitTimeoutSW = 5 * time.Second
 
 // keyframeWaitTimeoutSWFallback is the keyframe-wait timer for the main SW
-// fallback decoder (created after a VideoToolbox stall).  By the time SW
-// fallback is activated, the proactive ForceRefresh mechanism has already been
-// sending keyframe requests for ~7 s.  Windows servers consistently do not
-// deliver an IDR in response to keyframe requests post-stall; only a full
-// reconnect forces a new IDR.  A short window here triggers reconnect quickly
-// (total freeze ≈ 7 s VT stall + 3 s IDR wait + ~4 s reconnect ≈ 14 s total)
-// rather than waiting the full 8 s (19 s total).
-const keyframeWaitTimeoutSWFallback = 1 * time.Second
+// fallback decoder (created after a VideoToolbox stall).  Extended to 3 s to
+// give the server a fair window to respond to the ForceRefresh keyframe request
+// before escalating further.  Combined with the separate noIDRSoftResetCount
+// budget, this allows one retry cycle (up to ~6 s total) before reconnecting.
+const keyframeWaitTimeoutSWFallback = 3 * time.Second
 
 // profileWindow is the number of HW frames over which Decode aggregates
 // timing measurements before logging an INFO summary.  At 30 fps this is
