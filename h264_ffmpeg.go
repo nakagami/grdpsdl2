@@ -372,10 +372,11 @@ static void grdp_yuv420p_to_bgra_regions(
             uint8_t *drow = dst + row * dst_stride;
             int col = left;
 #ifdef __ARM_NEON__
-            // Advance scalar to the next multiple-of-16 boundary before the
-            // NEON loop.  The NEON helpers require col to be a multiple of 16
-            // (or 8 for the 8-pixel fallback) for correct UV pairing.
-            int neon_start = (col + 15) & ~15;
+            // Advance scalar to the next multiple-of-8 boundary before the
+            // NEON loop.  The only requirement for correct UV subsampling is
+            // that col is even; 8-alignment satisfies that and reduces the
+            // scalar pre-loop to at most 7 pixels (vs. 15 for 16-alignment).
+            int neon_start = (col + 7) & ~7;
             for (; col < neon_start && col < right; col++) {
                 int u = (int)urow[col >> 1] - 128;
                 int v = (int)vrow[col >> 1] - 128;
@@ -419,12 +420,12 @@ static inline void grdp_nv12_to_bgra_neon_8(
                                 vdupq_n_s16(yoff));
 
     // Load 8 UV bytes: [U0,V0,U1,V1,U2,V2,U3,V3].
-    // vuzp deinterleaves into .val[0]=[U0,U1,U2,U3,…] .val[1]=[V0,V1,V2,V3,…].
-    // vzip then duplicates each value for the two luma pixels it serves.
-    uint8x8_t uv_u8    = vld1_u8(uvrow + col);
-    uint8x8x2_t uv_sep = vuzp_u8(uv_u8, uv_u8);
-    uint8x8_t u8       = vzip_u8(uv_sep.val[0], uv_sep.val[0]).val[0]; // [U0,U0,U1,U1,…]
-    uint8x8_t v8       = vzip_u8(uv_sep.val[1], uv_sep.val[1]).val[0]; // [V0,V0,V1,V1,…]
+    // vtrn_u8(a,a) transposes pairs: val[0]=[a[0],a[0],a[2],a[2],…] val[1]=[a[1],a[1],a[3],a[3],…].
+    // Applied to interleaved NV12 this deinterleaves AND duplicates U and V in one instruction.
+    uint8x8_t uv_u8      = vld1_u8(uvrow + col);
+    uint8x8x2_t uv_dup   = vtrn_u8(uv_u8, uv_u8);
+    uint8x8_t u8         = uv_dup.val[0]; // [U0,U0,U1,U1,U2,U2,U3,U3]
+    uint8x8_t v8         = uv_dup.val[1]; // [V0,V0,V1,V1,V2,V2,V3,V3]
 
     int16x8_t u16 = vsubq_s16(vreinterpretq_s16_u16(vmovl_u8(u8)), vdupq_n_s16(128));
     int16x8_t v16 = vsubq_s16(vreinterpretq_s16_u16(vmovl_u8(v8)), vdupq_n_s16(128));
@@ -594,7 +595,7 @@ static void grdp_nv12_to_bgra_regions(
             uint8_t *drow = dst + row * dst_stride;
             int col = left;
 #ifdef __ARM_NEON__
-            int neon_start = (col + 15) & ~15;
+            int neon_start = (col + 7) & ~7;
             for (; col < neon_start && col < right; col++) {
                 int u = (int)uvrow[(col >> 1) * 2    ] - 128;
                 int v = (int)uvrow[(col >> 1) * 2 + 1] - 128;
@@ -2148,9 +2149,17 @@ func (d *ffmpegDecoder) convertFrame(regionHint []C.uint16_t, nRegions C.int) (*
 	// For NV12 (VideoToolbox HW transfer output) on ARM64, bypass swscale for
 	// the same reason: the non-accelerated ARM64 path ignores
 	// sws_setColorspaceDetails and produces a green cast on zero-filled frames.
+	//
+	// Exception: when dirty-region hints are provided, always use the
+	// hand-written region-aware functions even on x86_64.  swscale has no
+	// partial-frame API, so it would convert the full frame unconditionally.
+	// For typical RDP partial-screen updates (cursors, small windows) the
+	// scalar BT.601 loop over only the dirty pixels is significantly faster
+	// than running swscale over the entire frame.
+	haveRegions := nRegions > 0 && len(regionHint) > 0
 	var convErr error
 	switch {
-	case (srcFmt == C.AV_PIX_FMT_YUV420P || srcFmt == C.AV_PIX_FMT_YUVJ420P) && !useSwscale:
+	case (srcFmt == C.AV_PIX_FMT_YUV420P || srcFmt == C.AV_PIX_FMT_YUVJ420P) && (!useSwscale || haveRegions):
 		fullRange := C.int(0)
 		if srcFmt == C.AV_PIX_FMT_YUVJ420P || srcFrame.color_range == 2 {
 			fullRange = 1
@@ -2174,7 +2183,7 @@ func (d *ffmpegDecoder) convertFrame(regionHint []C.uint16_t, nRegions C.int) (*
 				d.swFrameCount++
 			}
 		}
-		if nRegions > 0 && len(regionHint) > 0 {
+		if haveRegions {
 			C.grdp_yuv420p_to_bgra_regions(srcFrame,
 				(*C.uint8_t)(unsafe.Pointer(&out[0])), C.int(w*4), fullRange,
 				(*C.uint16_t)(unsafe.Pointer(&regionHint[0])), nRegions)
@@ -2185,7 +2194,7 @@ func (d *ffmpegDecoder) convertFrame(regionHint []C.uint16_t, nRegions C.int) (*
 			})
 		}
 
-	case srcFmt == C.AV_PIX_FMT_NV12 && !useSwscale:
+	case srcFmt == C.AV_PIX_FMT_NV12 && (!useSwscale || haveRegions):
 		fullRange := C.int(0)
 		if srcFrame.color_range == 2 { // AVCOL_RANGE_JPEG
 			fullRange = 1
@@ -2234,7 +2243,7 @@ func (d *ffmpegDecoder) convertFrame(regionHint []C.uint16_t, nRegions C.int) (*
 			// Valid chroma seen — IOSurface is properly populated.
 			d.hwNeedsZeroCheck = false
 		}
-		if nRegions > 0 && len(regionHint) > 0 {
+		if haveRegions {
 			C.grdp_nv12_to_bgra_regions(srcFrame,
 				(*C.uint8_t)(unsafe.Pointer(&out[0])), C.int(w*4), fullRange,
 				(*C.uint16_t)(unsafe.Pointer(&regionHint[0])), nRegions)
