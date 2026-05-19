@@ -1285,6 +1285,17 @@ const avcHWRecoveryWindow = 500 * time.Millisecond
 // session start (observed: 5–25 frames / up to ~1 s at 30 fps).
 const avcHWNullFrameStallLimit = 25
 
+// avcHWEarlyStallMinElapsed is the minimum wall-clock time since the first
+// packet was sent (hwFirstSendTime) before the early-window null-frame stall
+// probe is allowed to fire.  VideoToolbox needs roughly 1 s to initialise
+// its pipeline regardless of how fast packets arrive, so at high packet rates
+// (e.g. a burst at session start) the 25-frame count threshold is hit in
+// milliseconds — far too quickly to distinguish a genuine stall from normal
+// initialisation.  By requiring at least 2 s of elapsed time we avoid
+// false-positive probes while still detecting real stalls well before the
+// 7-second safety valve.
+const avcHWEarlyStallMinElapsed = 2 * time.Second
+
 // avcHWMidSessionNullFrameLimit is the null-frame count threshold used for
 // mid-session stall detection (hwSentCount >= avcHWEarlyFrameLimit).
 // Normal GOP / mid-session IDR boundaries produce at most ~25 null frames
@@ -2236,7 +2247,9 @@ func (d *ffmpegDecoder) Decode(h264Data []byte) (*rdpgfx.H264Frame, error) {
 			//     comfortable headroom before the false-positive risk zone.
 			//     Reduces visible freeze from 7 s to ~5.5 s mid-session.
 			earlyStall := d.hwSentCount < avcHWEarlyFrameLimit &&
-				d.hwConsecNullFrames >= avcHWNullFrameStallLimit
+				d.hwConsecNullFrames >= avcHWNullFrameStallLimit &&
+				!d.hwFirstSendTime.IsZero() &&
+				time.Since(d.hwFirstSendTime) >= avcHWEarlyStallMinElapsed
 			midStall := d.hwSentCount >= avcHWEarlyFrameLimit &&
 				d.hwConsecNullFrames >= avcHWMidSessionNullFrameLimit
 			if (earlyStall || midStall) && d.stallProbeStart.IsZero() {
