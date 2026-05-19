@@ -36,18 +36,27 @@ package main
 #cgo nocallback grdp_sws_set_src_range
 #cgo noescape avcodec_send_packet
 #cgo noescape grdp_copy_yuv420p_to_i420
+#cgo nocallback grdp_copy_yuv420p_to_i420
 #cgo noescape grdp_copy_nv12_to_i420
+#cgo nocallback grdp_copy_nv12_to_i420
 #cgo noescape grdp_copy_nv12
+#cgo nocallback grdp_copy_nv12
 #cgo noescape grdp_yuv420p_to_bgra_regions
+#cgo nocallback grdp_yuv420p_to_bgra_regions
 #cgo noescape grdp_yuv420p_to_bgra_rows
-#cgo noescape grdp_nv12_to_bgra_regions
-#cgo noescape grdp_nv12_to_bgra_rows
 #cgo nocallback grdp_yuv420p_to_bgra_rows
+#cgo noescape grdp_nv12_to_bgra_regions
+#cgo nocallback grdp_nv12_to_bgra_regions
+#cgo noescape grdp_nv12_to_bgra_rows
 #cgo nocallback grdp_nv12_to_bgra_rows
 #cgo noescape grdp_frame_to_bgra
+#cgo nocallback grdp_frame_to_bgra
 #cgo noescape grdp_sample_nv12
+#cgo nocallback grdp_sample_nv12
 #cgo noescape grdp_sample_yuv
+#cgo nocallback grdp_sample_yuv
 #cgo noescape grdp_sample_nv12_at
+#cgo nocallback grdp_sample_nv12_at
 #include <libavcodec/avcodec.h>
 #include <libavutil/imgutils.h>
 #include <libavutil/hwcontext.h>
