@@ -299,6 +299,120 @@ static inline void grdp_yuv420p_to_bgra_neon_16(
 }
 #endif // __ARM_NEON__
 
+// ----------------------------------------------------------------------------
+// SSE2 YUV→BGRA inline helpers (x86_64)
+// Each function converts 8 luma pixels per call using 128-bit SIMD.
+// Coefficients and arithmetic match the NEON paths above (BT.601, fixed-point
+// with 8 fractional bits): R = (ky*Y + kr*V + 128) >> 8, etc.
+// _mm_madd_epi16 is used for the R and B channels because kb=516 overflows
+// int16 multiplication (516×127 = 65532 > 32767); madd widens to int32.
+// ----------------------------------------------------------------------------
+#ifdef __SSE2__
+
+// Shared BT.601 arithmetic core.  Receives pre-biased int16 vectors
+// y16 (Y − yoff), u16 (U − 128), v16 (V − 128) and stores 8 BGRA pixels.
+static inline void grdp_yuv_to_bgra_sse2_core(
+    __m128i y16, __m128i u16, __m128i v16,
+    uint8_t *drow, int col,
+    int16_t ky, int16_t kr, int16_t kgu, int16_t kgv, int16_t kb)
+{
+    const __m128i add128   = _mm_set1_epi32(128);
+    const __m128i alpha    = _mm_set1_epi8((char)255);
+    // Interleaved coefficient pairs for _mm_madd_epi16: elem0=ky, elem1=k?
+    const __m128i coeff_r  = _mm_set_epi16(kr,          ky, kr,          ky,
+                                            kr,          ky, kr,          ky);
+    const __m128i coeff_b  = _mm_set_epi16(kb,          ky, kb,          ky,
+                                            kb,          ky, kb,          ky);
+    // Green uses ky*Y − kgv*V (via madd) then adds −kgu*U (sign-extended).
+    const __m128i coeff_yv = _mm_set_epi16((int16_t)-kgv, ky, (int16_t)-kgv, ky,
+                                            (int16_t)-kgv, ky, (int16_t)-kgv, ky);
+    const __m128i neg_kgu  = _mm_set1_epi16((int16_t)-kgu);
+
+    __m128i yv_lo = _mm_unpacklo_epi16(y16, v16);
+    __m128i yu_lo = _mm_unpacklo_epi16(y16, u16);
+    __m128i r32_lo = _mm_add_epi32(_mm_madd_epi16(yv_lo, coeff_r), add128);
+    __m128i b32_lo = _mm_add_epi32(_mm_madd_epi16(yu_lo, coeff_b), add128);
+    __m128i g32_lo = _mm_madd_epi16(yv_lo, coeff_yv);
+    {
+        __m128i ngu = _mm_mullo_epi16(u16, neg_kgu);
+        // Sign-extend int16 ngu to int32 using srai-15 trick, then unpack.
+        g32_lo = _mm_add_epi32(g32_lo,
+            _mm_add_epi32(_mm_unpacklo_epi16(ngu, _mm_srai_epi16(ngu, 15)), add128));
+    }
+    __m128i yv_hi = _mm_unpackhi_epi16(y16, v16);
+    __m128i yu_hi = _mm_unpackhi_epi16(y16, u16);
+    __m128i r32_hi = _mm_add_epi32(_mm_madd_epi16(yv_hi, coeff_r), add128);
+    __m128i b32_hi = _mm_add_epi32(_mm_madd_epi16(yu_hi, coeff_b), add128);
+    __m128i g32_hi = _mm_madd_epi16(yv_hi, coeff_yv);
+    {
+        __m128i ngu = _mm_mullo_epi16(u16, neg_kgu);
+        g32_hi = _mm_add_epi32(g32_hi,
+            _mm_add_epi32(_mm_unpackhi_epi16(ngu, _mm_srai_epi16(ngu, 15)), add128));
+    }
+
+    // Shift right 8 (un-scale), pack int32→int16→uint8 (auto-saturating clamp).
+    __m128i r16 = _mm_packs_epi32(_mm_srai_epi32(r32_lo, 8), _mm_srai_epi32(r32_hi, 8));
+    __m128i g16 = _mm_packs_epi32(_mm_srai_epi32(g32_lo, 8), _mm_srai_epi32(g32_hi, 8));
+    __m128i b16 = _mm_packs_epi32(_mm_srai_epi32(b32_lo, 8), _mm_srai_epi32(b32_hi, 8));
+    __m128i r8  = _mm_packus_epi16(r16, r16);
+    __m128i g8  = _mm_packus_epi16(g16, g16);
+    __m128i b8  = _mm_packus_epi16(b16, b16);
+
+    // Interleave B,G,R,A into two 16-byte stores covering 8 BGRA pixels.
+    __m128i bg = _mm_unpacklo_epi8(b8, g8);
+    __m128i ra = _mm_unpacklo_epi8(r8, alpha);
+    _mm_storeu_si128((__m128i *)(drow + col * 4),      _mm_unpacklo_epi16(bg, ra));
+    _mm_storeu_si128((__m128i *)(drow + col * 4 + 16), _mm_unpackhi_epi16(bg, ra));
+}
+
+// 8-pixel NV12 (semi-planar Y + interleaved UV) → BGRA.
+static inline void grdp_nv12_to_bgra_sse2_8(
+    const uint8_t *yrow, const uint8_t *uvrow, uint8_t *drow, int col,
+    int16_t ky, int16_t kr, int16_t kgu, int16_t kgv, int16_t kb, int16_t yoff)
+{
+    const __m128i zero = _mm_setzero_si128();
+    __m128i y8  = _mm_loadl_epi64((const __m128i *)(yrow + col));
+    __m128i y16 = _mm_sub_epi16(_mm_unpacklo_epi8(y8, zero), _mm_set1_epi16(yoff));
+
+    // Load 8 interleaved UV bytes [U0,V0,U1,V1,...,U3,V3].
+    __m128i uv8    = _mm_loadl_epi64((const __m128i *)(uvrow + col));
+    // Isolate U (even bytes) and V (odd bytes), pack to low 8 bytes.
+    __m128i u_pack = _mm_packus_epi16(_mm_and_si128(uv8, _mm_set1_epi16((int16_t)0x00FF)), zero);
+    __m128i v_pack = _mm_packus_epi16(_mm_srli_epi16(uv8, 8), zero);
+    // Duplicate each sample to cover its two luma pixels, then extend to int16.
+    __m128i u16 = _mm_sub_epi16(
+        _mm_unpacklo_epi8(_mm_unpacklo_epi8(u_pack, u_pack), zero), _mm_set1_epi16(128));
+    __m128i v16 = _mm_sub_epi16(
+        _mm_unpacklo_epi8(_mm_unpacklo_epi8(v_pack, v_pack), zero), _mm_set1_epi16(128));
+
+    grdp_yuv_to_bgra_sse2_core(y16, u16, v16, drow, col, ky, kr, kgu, kgv, kb);
+}
+
+// 8-pixel planar YUV420P → BGRA.
+// FFmpeg guarantees at least 64-byte padding at end of each line buffer, so
+// loading 8 bytes when only 4 U/V bytes are needed per 8 luma pixels is safe.
+static inline void grdp_yuv420p_to_bgra_sse2_8(
+    const uint8_t *yrow, const uint8_t *urow, const uint8_t *vrow,
+    uint8_t *drow, int col,
+    int16_t ky, int16_t kr, int16_t kgu, int16_t kgv, int16_t kb, int16_t yoff)
+{
+    const __m128i zero = _mm_setzero_si128();
+    __m128i y8  = _mm_loadl_epi64((const __m128i *)(yrow + col));
+    __m128i y16 = _mm_sub_epi16(_mm_unpacklo_epi8(y8, zero), _mm_set1_epi16(yoff));
+
+    // Load 4 U and 4 V bytes (8-byte load; only low 4 used after duplication).
+    __m128i u4  = _mm_loadl_epi64((const __m128i *)(urow + (col >> 1)));
+    __m128i u16 = _mm_sub_epi16(
+        _mm_unpacklo_epi8(_mm_unpacklo_epi8(u4, u4), zero), _mm_set1_epi16(128));
+    __m128i v4  = _mm_loadl_epi64((const __m128i *)(vrow + (col >> 1)));
+    __m128i v16 = _mm_sub_epi16(
+        _mm_unpacklo_epi8(_mm_unpacklo_epi8(v4, v4), zero), _mm_set1_epi16(128));
+
+    grdp_yuv_to_bgra_sse2_core(y16, u16, v16, drow, col, ky, kr, kgu, kgv, kb);
+}
+
+#endif // __SSE2__
+
 static void grdp_yuv420p_to_bgra(
     const AVFrame *src, uint8_t *dst, int dst_stride, int full_range)
 {
@@ -324,6 +438,28 @@ static void grdp_yuv420p_to_bgra(
             grdp_yuv420p_to_bgra_neon_8(yrow, urow, vrow, drow, col,
                                         ky, kr, kgu, kgv, kb, yoff);
         // Scalar tail for widths not a multiple of 8.
+        for (; col < width; col++) {
+            int u = (int)urow[col >> 1] - 128;
+            int v = (int)vrow[col >> 1] - 128;
+            grdp_bt601_pixel((int)yrow[col], u, v, full_range, drow + col*4);
+        }
+    }
+#elif defined(__SSE2__)
+    int16_t ky   = full_range ? 256 : 298;
+    int16_t kr   = full_range ? 359 : 409;
+    int16_t kgu  = full_range ?  88 : 100;
+    int16_t kgv  = full_range ? 183 : 208;
+    int16_t kb   = full_range ? 454 : 516;
+    int16_t yoff = full_range ?   0 :  16;
+    for (int row = 0; row < height; row++) {
+        const uint8_t *yrow = src->data[0] + row        * src->linesize[0];
+        const uint8_t *urow = src->data[1] + (row >> 1) * src->linesize[1];
+        const uint8_t *vrow = src->data[2] + (row >> 1) * src->linesize[2];
+        uint8_t *drow = dst + row * dst_stride;
+        int col = 0;
+        for (; col + 7 < width; col += 8)
+            grdp_yuv420p_to_bgra_sse2_8(yrow, urow, vrow, drow, col,
+                                        ky, kr, kgu, kgv, kb, yoff);
         for (; col < width; col++) {
             int u = (int)urow[col >> 1] - 128;
             int v = (int)vrow[col >> 1] - 128;
@@ -363,6 +499,13 @@ static void grdp_yuv420p_to_bgra_regions(
     int16_t kgv  = full_range ? 183 : 208;
     int16_t kb   = full_range ? 454 : 516;
     int16_t yoff = full_range ?   0 :  16;
+#elif defined(__SSE2__)
+    int16_t ky   = full_range ? 256 : 298;
+    int16_t kr   = full_range ? 359 : 409;
+    int16_t kgu  = full_range ?  88 : 100;
+    int16_t kgv  = full_range ? 183 : 208;
+    int16_t kb   = full_range ? 454 : 516;
+    int16_t yoff = full_range ?   0 :  16;
 #endif
     for (int i = 0; i < n_rects; i++) {
         int left   = (int)rects[i*4+0];
@@ -396,6 +539,17 @@ static void grdp_yuv420p_to_bgra_regions(
                                               ky, kr, kgu, kgv, kb, yoff);
             for (; col + 7 < right; col += 8)
                 grdp_yuv420p_to_bgra_neon_8(yrow, urow, vrow, drow, col,
+                                             ky, kr, kgu, kgv, kb, yoff);
+#elif defined(__SSE2__)
+            // Advance to 8-aligned column so UV subsampling is always correct.
+            int sse_start = (col + 7) & ~7;
+            for (; col < sse_start && col < right; col++) {
+                int u = (int)urow[col >> 1] - 128;
+                int v = (int)vrow[col >> 1] - 128;
+                grdp_bt601_pixel((int)yrow[col], u, v, full_range, drow + col*4);
+            }
+            for (; col + 7 < right; col += 8)
+                grdp_yuv420p_to_bgra_sse2_8(yrow, urow, vrow, drow, col,
                                              ky, kr, kgu, kgv, kb, yoff);
 #endif
             for (; col < right; col++) {
@@ -557,6 +711,26 @@ static void grdp_nv12_to_bgra(
             grdp_bt601_pixel((int)yrow[col], u, v, full_range, drow + col*4);
         }
     }
+#elif defined(__SSE2__)
+    int16_t ky  = full_range ? 256 : 298;
+    int16_t kr  = full_range ? 359 : 409;
+    int16_t kgu = full_range ?  88 : 100;
+    int16_t kgv = full_range ? 183 : 208;
+    int16_t kb  = full_range ? 454 : 516;
+    int16_t yoff = full_range ? 0 : 16;
+    for (int row = 0; row < height; row++) {
+        const uint8_t *yrow  = src->data[0] + row        * src->linesize[0];
+        const uint8_t *uvrow = src->data[1] + (row >> 1) * src->linesize[1];
+        uint8_t *drow = dst + row * dst_stride;
+        int col = 0;
+        for (; col + 7 < width; col += 8)
+            grdp_nv12_to_bgra_sse2_8(yrow, uvrow, drow, col, ky, kr, kgu, kgv, kb, yoff);
+        for (; col < width; col++) {
+            int u = (int)uvrow[(col >> 1) * 2    ] - 128;
+            int v = (int)uvrow[(col >> 1) * 2 + 1] - 128;
+            grdp_bt601_pixel((int)yrow[col], u, v, full_range, drow + col*4);
+        }
+    }
 #else
     for (int row = 0; row < height; row++) {
         const uint8_t *yrow  = src->data[0] + row        * src->linesize[0];
@@ -581,6 +755,13 @@ static void grdp_nv12_to_bgra_regions(
     int width  = src->width;
     int height = src->height;
 #ifdef __ARM_NEON__
+    int16_t ky   = full_range ? 256 : 298;
+    int16_t kr   = full_range ? 359 : 409;
+    int16_t kgu  = full_range ?  88 : 100;
+    int16_t kgv  = full_range ? 183 : 208;
+    int16_t kb   = full_range ? 454 : 516;
+    int16_t yoff = full_range ?   0 :  16;
+#elif defined(__SSE2__)
     int16_t ky   = full_range ? 256 : 298;
     int16_t kr   = full_range ? 359 : 409;
     int16_t kgu  = full_range ?  88 : 100;
@@ -614,6 +795,15 @@ static void grdp_nv12_to_bgra_regions(
                 grdp_nv12_to_bgra_neon_16(yrow, uvrow, drow, col, ky, kr, kgu, kgv, kb, yoff);
             for (; col + 7 < right; col += 8)
                 grdp_nv12_to_bgra_neon_8(yrow, uvrow, drow, col, ky, kr, kgu, kgv, kb, yoff);
+#elif defined(__SSE2__)
+            int sse_start = (col + 7) & ~7;
+            for (; col < sse_start && col < right; col++) {
+                int u = (int)uvrow[(col >> 1) * 2    ] - 128;
+                int v = (int)uvrow[(col >> 1) * 2 + 1] - 128;
+                grdp_bt601_pixel((int)yrow[col], u, v, full_range, drow + col*4);
+            }
+            for (; col + 7 < right; col += 8)
+                grdp_nv12_to_bgra_sse2_8(yrow, uvrow, drow, col, ky, kr, kgu, kgv, kb, yoff);
 #endif
             for (; col < right; col++) {
                 int u = (int)uvrow[(col >> 1) * 2    ] - 128;
@@ -812,6 +1002,26 @@ static void grdp_nv12_to_bgra_rows(
             grdp_bt601_pixel((int)yrow[col], u, v, full_range, drow + col*4);
         }
     }
+#elif defined(__SSE2__)
+    int16_t ky  = full_range ? 256 : 298;
+    int16_t kr  = full_range ? 359 : 409;
+    int16_t kgu = full_range ?  88 : 100;
+    int16_t kgv = full_range ? 183 : 208;
+    int16_t kb  = full_range ? 454 : 516;
+    int16_t yoff = full_range ? 0 : 16;
+    for (int row = start_row; row < end_row; row++) {
+        const uint8_t *yrow  = src->data[0] + row        * src->linesize[0];
+        const uint8_t *uvrow = src->data[1] + (row >> 1) * src->linesize[1];
+        uint8_t *drow = dst + row * dst_stride;
+        int col = 0;
+        for (; col + 7 < width; col += 8)
+            grdp_nv12_to_bgra_sse2_8(yrow, uvrow, drow, col, ky, kr, kgu, kgv, kb, yoff);
+        for (; col < width; col++) {
+            int u = (int)uvrow[(col >> 1) * 2    ] - 128;
+            int v = (int)uvrow[(col >> 1) * 2 + 1] - 128;
+            grdp_bt601_pixel((int)yrow[col], u, v, full_range, drow + col*4);
+        }
+    }
 #else
     for (int row = start_row; row < end_row; row++) {
         const uint8_t *yrow  = src->data[0] + row        * src->linesize[0];
@@ -852,6 +1062,28 @@ static void grdp_yuv420p_to_bgra_rows(
                                           ky, kr, kgu, kgv, kb, yoff);
         for (; col + 7 < width; col += 8)
             grdp_yuv420p_to_bgra_neon_8(yrow, urow, vrow, drow, col,
+                                        ky, kr, kgu, kgv, kb, yoff);
+        for (; col < width; col++) {
+            int u = (int)urow[col >> 1] - 128;
+            int v = (int)vrow[col >> 1] - 128;
+            grdp_bt601_pixel((int)yrow[col], u, v, full_range, drow + col*4);
+        }
+    }
+#elif defined(__SSE2__)
+    int16_t ky   = full_range ? 256 : 298;
+    int16_t kr   = full_range ? 359 : 409;
+    int16_t kgu  = full_range ?  88 : 100;
+    int16_t kgv  = full_range ? 183 : 208;
+    int16_t kb   = full_range ? 454 : 516;
+    int16_t yoff = full_range ?   0 :  16;
+    for (int row = start_row; row < end_row; row++) {
+        const uint8_t *yrow = src->data[0] + row        * src->linesize[0];
+        const uint8_t *urow = src->data[1] + (row >> 1) * src->linesize[1];
+        const uint8_t *vrow = src->data[2] + (row >> 1) * src->linesize[2];
+        uint8_t *drow = dst + row * dst_stride;
+        int col = 0;
+        for (; col + 7 < width; col += 8)
+            grdp_yuv420p_to_bgra_sse2_8(yrow, urow, vrow, drow, col,
                                         ky, kr, kgu, kgv, kb, yoff);
         for (; col < width; col++) {
             int u = (int)urow[col >> 1] - 128;
@@ -911,19 +1143,45 @@ var convertWorkers = min(runtime.GOMAXPROCS(0), 4)
 // the gain from parallelism.
 const convertParallelMinH = 480
 
-// parallelConvertRows partitions [0, h) into convertWorkers equal bands and
-// calls fn(startRow, endRow) concurrently via goroutines.  For small frames
-// (h < convertParallelMinH) or when convertWorkers <= 1 the function is called
-// serially to avoid goroutine overhead.
-func parallelConvertRows(h int, fn func(s, e C.int)) {
-	n := convertWorkers
-	if n <= 1 || h < convertParallelMinH {
-		fn(0, C.int(h))
-		return
+// rowConvertJob is the work item dispatched to convertWorkerPool goroutines.
+type rowConvertJob struct {
+	fn   func(s, e C.int)
+	s, e C.int
+}
+
+// convertWorkerPool maintains N persistent goroutines for row-parallel
+// YUV→BGRA conversion, eliminating the per-frame goroutine allocation cost.
+// At 30fps with 4 workers the old code created ~120 goroutines/second; this
+// pool amortises that overhead down to zero after the first frame.
+type convertWorkerPool struct {
+	jobs chan rowConvertJob
+	done chan struct{}
+	n    int
+}
+
+func newConvertWorkerPool(n int) *convertWorkerPool {
+	p := &convertWorkerPool{
+		jobs: make(chan rowConvertJob, n),
+		done: make(chan struct{}, n),
+		n:    n,
 	}
-	var wg sync.WaitGroup
-	step := (h + n - 1) / n
-	for i := 0; i < n; i++ {
+	for range n {
+		go func() {
+			for job := range p.jobs {
+				job.fn(job.s, job.e)
+				p.done <- struct{}{}
+			}
+		}()
+	}
+	return p
+}
+
+// dispatch partitions [0, h) into p.n equal bands and executes fn
+// concurrently across the pool's persistent goroutines.
+func (p *convertWorkerPool) dispatch(h int, fn func(s, e C.int)) {
+	step := (h + p.n - 1) / p.n
+	count := 0
+	for i := 0; i < p.n; i++ {
 		s := i * step
 		e := s + step
 		if e > h {
@@ -932,13 +1190,33 @@ func parallelConvertRows(h int, fn func(s, e C.int)) {
 		if s >= h {
 			break
 		}
-		wg.Add(1)
-		go func(s, e int) {
-			defer wg.Done()
-			fn(C.int(s), C.int(e))
-		}(s, e)
+		p.jobs <- rowConvertJob{fn: fn, s: C.int(s), e: C.int(e)}
+		count++
 	}
-	wg.Wait()
+	for range count {
+		<-p.done
+	}
+}
+
+var (
+	globalConvertPool     *convertWorkerPool
+	globalConvertPoolOnce sync.Once
+)
+
+// parallelConvertRows partitions [0, h) into convertWorkers equal bands and
+// calls fn(startRow, endRow) concurrently via a persistent worker pool.  For
+// small frames (h < convertParallelMinH) or when convertWorkers <= 1 the
+// function is called serially to avoid scheduling overhead.
+func parallelConvertRows(h int, fn func(s, e C.int)) {
+	n := convertWorkers
+	if n <= 1 || h < convertParallelMinH {
+		fn(0, C.int(h))
+		return
+	}
+	globalConvertPoolOnce.Do(func() {
+		globalConvertPool = newConvertWorkerPool(n)
+	})
+	globalConvertPool.dispatch(h, fn)
 }
 
 // avLogOnce ensures grdp_suppress_av_log is called only once per process.
@@ -1811,10 +2089,11 @@ func (d *ffmpegDecoder) Decode(h264Data []byte) (*rdpgfx.H264Frame, error) {
 	// Count packets sent to HW decoder (for init timeout tracking).
 	if d.useHW {
 		d.hwSentCount++
+		hwNow := time.Now()
 		if d.hwSentCount == 1 {
-			d.hwFirstSendTime = time.Now()
+			d.hwFirstSendTime = hwNow
 		}
-		d.lastSendTime = time.Now()
+		d.lastSendTime = hwNow
 	}
 
 	sendStart := time.Now()
