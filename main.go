@@ -14,6 +14,7 @@ import (
 	"unsafe"
 
 	"github.com/nakagami/grdp"
+	_ "github.com/nakagami/grdp/plugin/rdpgfx/ffmpeg"
 	"github.com/nakagami/grdp/plugin/rdpsnd"
 	"github.com/veandco/go-sdl2/sdl"
 )
