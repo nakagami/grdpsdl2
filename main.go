@@ -897,8 +897,14 @@ func mainLoop(hostPort, domain, user, password string, width, height int, swapAl
 			slog.Debug("on error (during reconnect, suppressed)", "err", e)
 			return
 		}
-		slog.Error("on error", "err", e)
-		connectionErrorPending.Store(true)
+		// Use CompareAndSwap so only the first error is logged; cascading errors
+		// (e.g. "use of closed network connection" after a server disconnect) are
+		// suppressed to avoid redundant noise.
+		if !connectionErrorPending.CompareAndSwap(false, true) {
+			slog.Debug("on error (cascaded, suppressed)", "err", e)
+			return
+		}
+		slog.Warn("on error", "err", e)
 		if bitmapEventType != sdl.FIRSTEVENT && eventPending.CompareAndSwap(false, true) {
 			sdl.PushEvent(wakeEvent)
 		}
