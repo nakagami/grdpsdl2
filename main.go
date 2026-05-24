@@ -38,6 +38,14 @@ const h264DropCooldown = time.Second
 // accordingly.  0 = no congestion, 0xFFFFFFFF = pause entirely.
 const h264CongestionHint uint32 = 20
 
+// maxBitmapBatchesPerTick limits how many bitmap batches are painted to the
+// GPU texture in a single main-loop iteration.  Processing all pending batches
+// at once (unlimited) can cause a stall spike when VirtualBox sends a large
+// burst of updates.  Limiting to 1 spreads the GPU writes across render ticks,
+// smoothing out latency at the cost of catching up slightly more slowly.
+// Tune this value to taste: 1 = most even, higher = faster catch-up.
+const maxBitmapBatchesPerTick = 1
+
 // fillBytes sets every element of s to v using a doubling-copy strategy.
 // copy() is implemented with SIMD instructions (NEON on ARM64, AVX on x86),
 // so this is O(log n) SIMD copies instead of O(n) scalar writes —
@@ -1249,19 +1257,21 @@ func mainLoop(hostPort, domain, user, password string, width, height int, swap_a
 			}
 		}
 
-	drain:
-		for {
-			select {
-			case bs := <-bitmapCh:
-				paintImages(bs, texture, &overlayDirtyRects)
-				for i := range bs {
-					bitmapBufPool.Put(bs[i].Data)
-				}
-				renderDirty = 3
-			default:
-				break drain
+	// Drain at most maxBitmapBatchesPerTick batches per render tick so that
+	// a burst of updates from the server (e.g. VirtualBox) does not accumulate
+	// all GPU texture writes into a single blocking spike.  Any remaining
+	// batches stay in bitmapCh and are processed in the next iteration.
+	for range maxBitmapBatchesPerTick {
+		select {
+		case bs := <-bitmapCh:
+			paintImages(bs, texture, &overlayDirtyRects)
+			for i := range bs {
+				bitmapBufPool.Put(bs[i].Data)
 			}
+			renderDirty = 3
+		default:
 		}
+	}
 		// Render only when content has changed.  renderDirty counts down so that
 		// every backbuffer is refreshed before we pause (SDL2 double/triple
 		// buffering requires re-issuing the same draw commands until all buffers
@@ -1487,8 +1497,14 @@ func main() {
 	// slog.SetDefault(slog.New(handler))
 
 	swap_alt_meta := flag.Bool("swap-alt-meta", false, "swap alt and meta key")
+	debugLog := flag.Bool("debug", false, "enable debug logging")
 	flag.Parse()
-	slog.Debug("flag", "swap_alt_meta", *swap_alt_meta)
+
+	if *debugLog {
+		handler := slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelDebug})
+		slog.SetDefault(slog.New(handler))
+	}
+	slog.Debug("flag", "swap_alt_meta", *swap_alt_meta, "debug", *debugLog)
 
 	hostPort := strings.Join([]string{os.Getenv("GRDP_HOST"), os.Getenv("GRDP_PORT")}, ":")
 	domain := os.Getenv("GRDP_DOMAIN")
