@@ -38,14 +38,6 @@ const h264DropCooldown = time.Second
 // accordingly.  0 = no congestion, 0xFFFFFFFF = pause entirely.
 const h264CongestionHint uint32 = 20
 
-// maxBitmapBatchesPerTick limits how many bitmap batches are painted to the
-// GPU texture in a single main-loop iteration.  Processing all pending batches
-// at once (unlimited) can cause a stall spike when VirtualBox sends a large
-// burst of updates.  Limiting to 1 spreads the GPU writes across render ticks,
-// smoothing out latency at the cost of catching up slightly more slowly.
-// Tune this value to taste: 1 = most even, higher = faster catch-up.
-const maxBitmapBatchesPerTick = 1
-
 // fillBytes sets every element of s to v using a doubling-copy strategy.
 // copy() is implemented with SIMD instructions (NEON on ARM64, AVX on x86),
 // so this is O(log n) SIMD copies instead of O(n) scalar writes —
@@ -1133,6 +1125,9 @@ func mainLoop(hostPort, domain, user, password string, width, height int, swapAl
 	var resizePending bool
 	var resizeTime time.Time
 	var resizeW, resizeH int32
+	// allBitmaps accumulates bitmaps drained from bitmapCh each render tick.
+	// Declared outside the loop so the backing array is reused across ticks.
+	var allBitmaps []grdp.Bitmap
 
 	for !quit {
 		// Always use a 50 ms timeout.  H.264 and bitmap callbacks push a wake
@@ -1305,20 +1300,26 @@ func mainLoop(hostPort, domain, user, password string, width, height int, swapAl
 			}
 		}
 
-		// Drain at most maxBitmapBatchesPerTick batches per render tick so that
-		// a burst of updates from the server (e.g. VirtualBox) does not accumulate
-		// all GPU texture writes into a single blocking spike.  Any remaining
-		// batches stay in bitmapCh and are processed in the next iteration.
-		for range maxBitmapBatchesPerTick {
+		// Drain ALL pending bitmap batches and combine into one paintImages call.
+		// Processing every queued patch in a single call reduces cgo overhead,
+		// eliminates catch-up lag on burst updates, and provides a larger batch
+		// for the bounding-rect Lock optimisation when it is re-enabled.
+		allBitmaps = allBitmaps[:0]
+	drainBitmaps:
+		for {
 			select {
 			case bs := <-bitmapCh:
-				paintImages(bs, texture, &overlayDirtyRects)
-				for i := range bs {
-					bitmapBufPool.Put(bs[i].Data)
-				}
-				renderDirty = 3
+				allBitmaps = append(allBitmaps, bs...)
 			default:
+				break drainBitmaps
 			}
+		}
+		if len(allBitmaps) > 0 {
+			paintImages(allBitmaps, texture, &overlayDirtyRects)
+			for i := range allBitmaps {
+				bitmapBufPool.Put(allBitmaps[i].Data)
+			}
+			renderDirty = 3
 		}
 
 		// Render only when content has changed.  renderDirty counts down so that
