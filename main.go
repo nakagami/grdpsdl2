@@ -159,6 +159,16 @@ func paintImages(bs []grdp.Bitmap, texture *sdl.Texture, width, height int, dirt
 		}
 		return
 	}
+	// go-sdl2 computes the slice length as (pitch/textureWidth)*(textureWidth*(H-1)+W).
+	// On macOS/Metal, SDL_LockTexture returns pitch = lockRect.W*bpp rather than
+	// textureWidth*bpp, so the integer division pitch/textureWidth truncates and the
+	// resulting slice length is too small.  The actual allocation is pitch*lockRect.H
+	// bytes; fix the slice header so row navigation with the real pitch stays in bounds.
+	if correctLen := pitch * int(lockRect.H); correctLen > len(pixels) {
+		slog.Debug("paintImages: extending pixels slice",
+			"old_len", len(pixels), "correct_len", correctLen, "pitch", pitch, "lockRect_H", lockRect.H)
+		pixels = unsafe.Slice(&pixels[0], correctLen)
+	}
 	slog.Debug("paintImages lock",
 		"lockRect", lockRect,
 		"pixels_len", len(pixels), "pitch", pitch,
