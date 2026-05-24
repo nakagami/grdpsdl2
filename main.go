@@ -68,15 +68,9 @@ func fillBytes(s []byte, v byte) {
 // Slow-path (legacy bit-depth) bitmaps are uncommon and fall back to per-patch
 // Update as before.
 func paintImages(bs []grdp.Bitmap, texture *sdl.Texture, width, height int, dirtyRects *[]sdl.Rect) {
-	// First pass: handle slow-path (legacy bpp) bitmaps immediately and compute
-	// the bounding rect of the visible portions of fast-path (BitsPerPixel==4)
-	// bitmaps, clamped to [0, width) × [0, height).
-	bx0, by0, bx1, by1 := width, height, 0, 0
-	fastCount := 0
-	totalBitmapArea := 0
+	// First pass: handle slow-path (legacy bpp) bitmaps immediately.
 	for _, bm := range bs {
 		if bm.BitsPerPixel != 4 {
-			// Slow path: convert to RGBA, swap R↔B in-place, update texture.
 			img := bm.RGBA()
 			if len(img.Pix) == 0 {
 				continue
@@ -91,150 +85,18 @@ func paintImages(bs []grdp.Bitmap, texture *sdl.Texture, width, height int, dirt
 			rect := sdl.Rect{X: int32(bm.DestLeft), Y: int32(bm.DestTop), W: int32(w), H: int32(h)}
 			texture.Update(&rect, unsafe.Pointer(&img.Pix[0]), img.Stride)
 			*dirtyRects = append(*dirtyRects, rect)
-			continue
 		}
-		if len(bm.Data) == 0 {
-			continue
-		}
-		w := min(bm.DestRight-bm.DestLeft+1, bm.Width)
-		h := min(bm.DestBottom-bm.DestTop+1, bm.Height)
-		if w <= 0 || h <= 0 {
-			continue
-		}
-		// Clamp to texture bounds so the bounding rect never has negative
-		// coordinates or extends beyond the texture edge.
-		x0 := max(bm.DestLeft, 0)
-		y0 := max(bm.DestTop, 0)
-		x1 := min(bm.DestLeft+w, width)
-		y1 := min(bm.DestTop+h, height)
-		if x1 <= x0 || y1 <= y0 {
-			continue // entirely off-screen
-		}
-		fastCount++
-		totalBitmapArea += (x1 - x0) * (y1 - y0)
-		bx0 = min(bx0, x0)
-		by0 = min(by0, y0)
-		bx1 = max(bx1, x1)
-		by1 = max(by1, y1)
 	}
 
-	if fastCount == 0 {
-		return
-	}
-
-	// Single fast-path patch: one SDL_UpdateTexture call is optimal.
-	if fastCount == 1 {
-		for _, bm := range bs {
-			if bm.BitsPerPixel != 4 || len(bm.Data) == 0 {
-				continue
-			}
-			w := min(bm.DestRight-bm.DestLeft+1, bm.Width)
-			h := min(bm.DestBottom-bm.DestTop+1, bm.Height)
-			if w <= 0 || h <= 0 {
-				continue
-			}
-			rect := sdl.Rect{X: int32(bm.DestLeft), Y: int32(bm.DestTop), W: int32(w), H: int32(h)}
-			texture.Update(&rect, unsafe.Pointer(&bm.Data[0]), bm.Width*4)
-			*dirtyRects = append(*dirtyRects, rect)
-		}
-		return
-	}
-
-	// Multiple fast-path patches: lock the bounding rect once and copy all
-	// rows in Go — two cgo calls instead of N SDL_UpdateTexture calls.
+	// Second pass: fast-path (BitsPerPixel==4) bitmaps — one SDL_UpdateTexture
+	// call per patch.  SDL_UpdateTexture is a read-modify-write operation that
+	// only touches the specified rect, so patches at different screen locations
+	// do not overwrite each other or the surrounding texture content.
 	//
-	// On macOS/Metal SDL_LockTexture returns a new zero-initialised staging
-	// buffer, NOT the current texture content.  When the patches are sparse
-	// (i.e. they don't collectively cover most of the bounding rect), the
-	// uncovered pixels inside the lock rect are written as black, erasing the
-	// existing texture content in those areas.  Use the lock path only when
-	// the bitmaps cover at least 75% of the bounding rect; otherwise fall
-	// back to individual SDL_UpdateTexture calls, which are read-modify-write.
-	lockRectArea := (bx1 - bx0) * (by1 - by0)
-	useLockPath := lockRectArea > 0 && totalBitmapArea*4 >= lockRectArea*3 // fill ≥ 75%
-	if !useLockPath {
-		slog.Debug("paintImages: sparse bitmaps, using per-patch SDL_UpdateTexture",
-			"fastCount", fastCount,
-			"totalBitmapArea", totalBitmapArea,
-			"lockRectArea", lockRectArea,
-		)
-		for _, bm := range bs {
-			if bm.BitsPerPixel != 4 || len(bm.Data) == 0 {
-				continue
-			}
-			w := min(bm.DestRight-bm.DestLeft+1, bm.Width)
-			h := min(bm.DestBottom-bm.DestTop+1, bm.Height)
-			if w <= 0 || h <= 0 {
-				continue
-			}
-			x0 := max(bm.DestLeft, 0)
-			y0 := max(bm.DestTop, 0)
-			x1 := min(bm.DestLeft+w, width)
-			y1 := min(bm.DestTop+h, height)
-			if x1 <= x0 || y1 <= y0 {
-				continue
-			}
-			srcCol := x0 - bm.DestLeft
-			rect := sdl.Rect{X: int32(x0), Y: int32(y0), W: int32(x1 - x0), H: int32(y1 - y0)}
-			texture.Update(&rect, unsafe.Pointer(&bm.Data[srcCol*4]), bm.Width*4)
-			*dirtyRects = append(*dirtyRects, rect)
-		}
-		return
-	}
-
-	lockRect := sdl.Rect{X: int32(bx0), Y: int32(by0), W: int32(bx1 - bx0), H: int32(by1 - by0)}
-	pixels, pitch, err := texture.Lock(&lockRect)
-	if err != nil {
-		// Lock failed: fall back to per-patch SDL_UpdateTexture.
-		for _, bm := range bs {
-			if bm.BitsPerPixel != 4 || len(bm.Data) == 0 {
-				continue
-			}
-			w := min(bm.DestRight-bm.DestLeft+1, bm.Width)
-			h := min(bm.DestBottom-bm.DestTop+1, bm.Height)
-			if w <= 0 || h <= 0 {
-				continue
-			}
-			rect := sdl.Rect{X: int32(bm.DestLeft), Y: int32(bm.DestTop), W: int32(w), H: int32(h)}
-			texture.Update(&rect, unsafe.Pointer(&bm.Data[0]), bm.Width*4)
-			*dirtyRects = append(*dirtyRects, rect)
-		}
-		return
-	}
-	// go-sdl2 computes the slice length as (pitch/textureWidth)*(textureWidth*(H-1)+W).
-	// On macOS/Metal, SDL_LockTexture returns pitch = lockRect.W*bpp rather than
-	// textureWidth*bpp, so the integer division pitch/textureWidth truncates and the
-	// resulting slice length is too small.  The actual allocation is pitch*lockRect.H
-	// bytes; fix the slice header so row navigation with the real pitch stays in bounds.
-	// When the truncation is so severe that the computed length is 0, pixels is an
-	// empty slice and &pixels[0] would panic; fall back to per-patch SDL_UpdateTexture.
-	if len(pixels) == 0 {
-		texture.Unlock()
-		for _, bm := range bs {
-			if bm.BitsPerPixel != 4 || len(bm.Data) == 0 {
-				continue
-			}
-			w := min(bm.DestRight-bm.DestLeft+1, bm.Width)
-			h := min(bm.DestBottom-bm.DestTop+1, bm.Height)
-			if w <= 0 || h <= 0 {
-				continue
-			}
-			rect := sdl.Rect{X: int32(bm.DestLeft), Y: int32(bm.DestTop), W: int32(w), H: int32(h)}
-			texture.Update(&rect, unsafe.Pointer(&bm.Data[0]), bm.Width*4)
-			*dirtyRects = append(*dirtyRects, rect)
-		}
-		return
-	}
-	if correctLen := pitch * int(lockRect.H); correctLen > len(pixels) {
-		slog.Debug("paintImages: extending pixels slice",
-			"old_len", len(pixels), "correct_len", correctLen, "pitch", pitch, "lockRect_H", lockRect.H)
-		pixels = unsafe.Slice(&pixels[0], correctLen)
-	}
-	slog.Debug("paintImages lock",
-		"lockRect", lockRect,
-		"pixels_len", len(pixels), "pitch", pitch,
-		"width", width, "height", height,
-	)
+	// Note: SDL_LockTexture on macOS/Metal returns a zero-initialised staging
+	// buffer rather than the existing texture content, so batching patches into
+	// a single Lock+Unlock would paint black over any gap between patches.
+	// Per-patch SDL_UpdateTexture avoids that problem entirely.
 	for _, bm := range bs {
 		if bm.BitsPerPixel != 4 || len(bm.Data) == 0 {
 			continue
@@ -244,7 +106,6 @@ func paintImages(bs []grdp.Bitmap, texture *sdl.Texture, width, height int, dirt
 		if w <= 0 || h <= 0 {
 			continue
 		}
-		// Compute the visible, in-bounds portion of this bitmap.
 		x0 := max(bm.DestLeft, 0)
 		y0 := max(bm.DestTop, 0)
 		x1 := min(bm.DestLeft+w, width)
@@ -252,47 +113,20 @@ func paintImages(bs []grdp.Bitmap, texture *sdl.Texture, width, height int, dirt
 		if x1 <= x0 || y1 <= y0 {
 			continue
 		}
-		rw := x1 - x0 // visible width
-		rh := y1 - y0 // visible height
-		rx := x0 - bx0 // column offset within lock rect (≥ 0)
-		ry := y0 - by0 // row offset within lock rect (≥ 0)
-		// Pixel offset within bm.Data for the first visible row/column.
-		srcCol := x0 - bm.DestLeft // columns to skip (= max(0, −bm.DestLeft))
-		srcRow := y0 - bm.DestTop  // rows to skip    (= max(0, −bm.DestTop))
-		srcStride := bm.Width * 4
+		srcCol := x0 - bm.DestLeft
+		srcRow := y0 - bm.DestTop
 		slog.Debug("paintImages bitmap",
 			"dest", fmt.Sprintf("%d,%d-%d,%d", bm.DestLeft, bm.DestTop, bm.DestRight, bm.DestBottom),
 			"bm_wh", fmt.Sprintf("%dx%d bpp=%d", bm.Width, bm.Height, bm.BitsPerPixel),
 			"visible_x0y0x1y1", fmt.Sprintf("%d,%d,%d,%d", x0, y0, x1, y1),
-			"rx_ry_rw_rh", fmt.Sprintf("%d,%d,%d,%d", rx, ry, rw, rh),
+			"srcCol_srcRow", fmt.Sprintf("%d,%d", srcCol, srcRow),
 			"data_len", len(bm.Data),
 		)
-		for row := range rh {
-			srcOff := (srcRow+row)*srcStride + srcCol*4
-			dstOff := (ry+row)*pitch + rx*4
-			dstEnd := dstOff + rw*4
-			srcEnd := srcOff + rw*4
-			if dstEnd > len(pixels) || srcEnd > len(bm.Data) {
-				slog.Error("paintImages: out-of-bounds access",
-					"lockRect", lockRect,
-					"pixels_len", len(pixels), "pitch", pitch,
-					"width", width, "height", height,
-					"dest", fmt.Sprintf("%d,%d-%d,%d", bm.DestLeft, bm.DestTop, bm.DestRight, bm.DestBottom),
-					"bm_wh", fmt.Sprintf("%dx%d", bm.Width, bm.Height),
-					"x0y0x1y1", fmt.Sprintf("%d,%d,%d,%d", x0, y0, x1, y1),
-					"bx0by0bx1by1", fmt.Sprintf("%d,%d,%d,%d", bx0, by0, bx1, by1),
-					"rx_ry_rw_rh", fmt.Sprintf("%d,%d,%d,%d", rx, ry, rw, rh),
-					"row", row,
-					"srcOff_srcEnd", fmt.Sprintf("%d:%d (cap=%d)", srcOff, srcEnd, len(bm.Data)),
-					"dstOff_dstEnd", fmt.Sprintf("%d:%d (cap=%d)", dstOff, dstEnd, len(pixels)),
-				)
-				continue
-			}
-			copy(pixels[dstOff:dstEnd], bm.Data[srcOff:srcEnd])
-		}
-		*dirtyRects = append(*dirtyRects, sdl.Rect{X: int32(x0), Y: int32(y0), W: int32(rw), H: int32(rh)})
+		srcOff := srcRow*bm.Width*4 + srcCol*4
+		rect := sdl.Rect{X: int32(x0), Y: int32(y0), W: int32(x1 - x0), H: int32(y1 - y0)}
+		texture.Update(&rect, unsafe.Pointer(&bm.Data[srcOff]), bm.Width*4)
+		*dirtyRects = append(*dirtyRects, rect)
 	}
-	texture.Unlock()
 }
 
 // uploadYUVFrame uploads a decoded H.264 YUV frame into the SDL2 YUV texture.
