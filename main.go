@@ -626,14 +626,19 @@ func mainLoop(hostPort, domain, user, password string, width, height int, swap_a
 	overlayDirtyRects := make([]sdl.Rect, 0, 64)
 
 	// clearOverlayDirty clears the overlay texture regions accumulated in
-	// overlayDirtyRects and resets the slice.  When the number of dirty rects
-	// exceeds a threshold, a single full-texture update is cheaper than many
-	// individual SDL_UpdateTexture calls (each incurring a separate GPU blit).
+	// overlayDirtyRects and resets the slice.  The break-even between individual
+	// SDL_UpdateTexture calls (one GPU blit each) and a single full-texture
+	// upload is determined by area: if the total dirty area exceeds half the
+	// texture, a single upload is cheaper.
 	clearOverlayDirty := func() {
 		if len(overlayDirtyRects) == 0 {
 			return
 		}
-		if len(overlayDirtyRects) > 8 {
+		var dirtyArea int
+		for _, r := range overlayDirtyRects {
+			dirtyArea += int(r.W) * int(r.H)
+		}
+		if dirtyArea*2 > width*height {
 			// Batch path: one GPU upload clears the entire overlay texture.
 			texture.Update(nil, unsafe.Pointer(&overlayZero[0]), width*4)
 		} else {
@@ -654,8 +659,9 @@ func mainLoop(hostPort, domain, user, password string, width, height int, swap_a
 
 	// Register a custom SDL event type to wake the main loop when bitmaps arrive.
 	bitmapEventType := sdl.RegisterEvents(1)
-	// Pre-allocate the wake event once so callbacks never heap-allocate on the hot path.
+	// Pre-allocate wake events once so callbacks never heap-allocate on the hot path.
 	wakeEvent := &sdl.UserEvent{Type: bitmapEventType}
+	decoderBrokenEvent := &sdl.UserEvent{Type: bitmapEventType}
 
 	rdpClient := grdp.NewRdpClient(hostPort, width, height, func(hostPort string) (net.Conn, error) {
 		dialer := &net.Dialer{
@@ -811,7 +817,7 @@ func mainLoop(hostPort, domain, user, password string, width, height int, swap_a
 		slog.Warn("decoder broken; scheduling reconnect")
 		decoderBrokenPending.Store(true)
 		if bitmapEventType != sdl.FIRSTEVENT && eventPending.CompareAndSwap(false, true) {
-			sdl.PushEvent(&sdl.UserEvent{Type: bitmapEventType})
+			sdl.PushEvent(decoderBrokenEvent)
 		}
 	})
 
@@ -1021,6 +1027,15 @@ func mainLoop(hostPort, domain, user, password string, width, height int, swap_a
 	// truly stuck session.
 	const videoStallTimeout = 10 * time.Second
 
+	// renderDirty counts down from 3 to 0.  It is set to 3 whenever new content
+	// arrives (YUV frame, bitmap patch, or reconnect).  The render trio
+	// (Clear/Copy/Present) is only called while renderDirty > 0, and is
+	// decremented after each Present.  Using 3 instead of 2 is safe for both
+	// double- and triple-buffered SDL2 renderers: every backbuffer is refreshed
+	// before we pause, preventing a stale buffer from flashing through.
+	// Initialized to 3 so the initial black frame is presented correctly.
+	renderDirty := 3
+
 	// resetAfterReconnect recreates textures and resets rendering state after a
 	// successful Reconnect.  Extracted to avoid duplicating ~25 lines between
 	// the resize-reconnect and video-stall-reconnect paths.
@@ -1059,6 +1074,7 @@ func mainLoop(hostPort, domain, user, password string, width, height int, swap_a
 		yuvTextureIsNull = false
 		ap.reopenNeeded.Store(false)
 		ap.reset()
+		renderDirty = 3
 	}
 
 	quit := false
@@ -1069,7 +1085,15 @@ func mainLoop(hostPort, domain, user, password string, width, height int, swap_a
 	lastClipboardCheck := time.Now()
 
 	for !quit {
-		event := sdl.WaitEventTimeout(8)
+		// Use a short timeout during active rendering so new frames are picked up
+		// quickly.  When idle (renderDirty == 0) extend to 50 ms — H.264 and
+		// bitmap callbacks wake the loop via sdl.PushEvent, and SDL input events
+		// (keyboard/mouse) also wake it immediately, so responsiveness is unchanged.
+		waitMs := 50
+		if renderDirty > 0 {
+			waitMs = 8
+		}
+		event := sdl.WaitEventTimeout(waitMs)
 
 		// Coalesce mouse-motion events: only the final position in each tick
 		// is sent to the server, eliminating redundant RDP mouse-move packets.
@@ -1181,6 +1205,7 @@ func mainLoop(hostPort, domain, user, password string, width, height int, swap_a
 				} else {
 					yuvTextureIsNull = true
 				}
+				renderDirty = 3
 			default:
 			}
 		} else {
@@ -1215,6 +1240,7 @@ func mainLoop(hostPort, domain, user, password string, width, height int, swap_a
 					yuvReady = true
 					yuvTextureIsNull = false
 				}
+				renderDirty = 3
 			}
 		}
 
@@ -1226,23 +1252,34 @@ func mainLoop(hostPort, domain, user, password string, width, height int, swap_a
 				for i := range bs {
 					bitmapBufPool.Put(bs[i].Data)
 				}
+				renderDirty = 3
 			default:
 				break drain
 			}
 		}
-		// Always copy textures and present so the last frame stays visible even
-		// when no new data arrives (e.g. video stall, idle desktop).  SDL2's
-		// double-buffering requires re-copying every frame; skipping Copy on
-		// non-dirty frames causes the empty backbuffer to flash through.
-		// Clear to black first so the uninitialized renderer background (which
-		// shows through the initially-transparent BGRA overlay) is not visible.
-		renderer.SetDrawColor(0, 0, 0, 255)
-		renderer.Clear()
-		if yuvReady && !yuvTextureIsNull {
-			renderer.Copy(yuvTexture, nil, nil)
+		// Render only when content has changed.  renderDirty counts down so that
+		// every backbuffer is refreshed before we pause (SDL2 double/triple
+		// buffering requires re-issuing the same draw commands until all buffers
+		// are updated, otherwise a stale empty backbuffer flashes through).
+		if renderDirty > 0 {
+			// Clear to black first so the uninitialized renderer background (which
+			// shows through the initially-transparent BGRA overlay) is not visible.
+			renderer.SetDrawColor(0, 0, 0, 255)
+			renderer.Clear()
+			if yuvReady && !yuvTextureIsNull {
+				renderer.Copy(yuvTexture, nil, nil)
+			}
+			// Skip the overlay copy when the texture is fully transparent —
+			// clearOverlayDirty() has already zeroed every dirty rect, so
+			// overlayDirtyRects being empty means there is no bitmap content to
+			// blend.  In bitmap-only sessions (!yuvReady) we always copy because
+			// the overlay holds all visible content.
+			if len(overlayDirtyRects) > 0 || !yuvReady {
+				renderer.Copy(texture, nil, nil)
+			}
+			renderer.Present()
+			renderDirty--
 		}
-		renderer.Copy(texture, nil, nil)
-		renderer.Present()
 
 		// Handle clipboard from server (server → client)
 		select {
@@ -1263,7 +1300,7 @@ func mainLoop(hostPort, domain, user, password string, width, height int, swap_a
 		}
 
 		// Poll local clipboard changes
-		if time.Since(lastClipboardCheck) > 500*time.Millisecond {
+		if time.Since(lastClipboardCheck) > time.Second {
 			lastClipboardCheck = time.Now()
 			if text, err := sdl.GetClipboardText(); err == nil && text != lastClipboardText {
 				lastClipboardText = text
