@@ -164,6 +164,25 @@ func paintImages(bs []grdp.Bitmap, texture *sdl.Texture, width, height int, dirt
 	// textureWidth*bpp, so the integer division pitch/textureWidth truncates and the
 	// resulting slice length is too small.  The actual allocation is pitch*lockRect.H
 	// bytes; fix the slice header so row navigation with the real pitch stays in bounds.
+	// When the truncation is so severe that the computed length is 0, pixels is an
+	// empty slice and &pixels[0] would panic; fall back to per-patch SDL_UpdateTexture.
+	if len(pixels) == 0 {
+		texture.Unlock()
+		for _, bm := range bs {
+			if bm.BitsPerPixel != 4 || len(bm.Data) == 0 {
+				continue
+			}
+			w := min(bm.DestRight-bm.DestLeft+1, bm.Width)
+			h := min(bm.DestBottom-bm.DestTop+1, bm.Height)
+			if w <= 0 || h <= 0 {
+				continue
+			}
+			rect := sdl.Rect{X: int32(bm.DestLeft), Y: int32(bm.DestTop), W: int32(w), H: int32(h)}
+			texture.Update(&rect, unsafe.Pointer(&bm.Data[0]), bm.Width*4)
+			*dirtyRects = append(*dirtyRects, rect)
+		}
+		return
+	}
 	if correctLen := pitch * int(lockRect.H); correctLen > len(pixels) {
 		slog.Debug("paintImages: extending pixels slice",
 			"old_len", len(pixels), "correct_len", correctLen, "pitch", pitch, "lockRect_H", lockRect.H)
@@ -772,6 +791,16 @@ func mainLoop(hostPort, domain, user, password string, width, height int, swapAl
 	// Pre-allocated with capacity 64 to avoid append reallocation on typical frames.
 	overlayDirtyRects := make([]sdl.Rect, 0, 64)
 
+	// overlayHasContent is true when the overlay (BGRA) texture contains at least
+	// one non-transparent bitmap patch.  It is set to true whenever paintImages
+	// writes any pixels and reset to false only when a Tier-1 clearOverlayDirty
+	// wipes the entire texture or on reconnect.  Unlike overlayDirtyRects (which
+	// is emptied on every H.264 frame), this flag persists across frames so that
+	// persistent UI elements (desktop background, taskbar, menus) outside the
+	// recently-dirtied video region are still copied to the renderer even after
+	// clearOverlayDirty empties overlayDirtyRects.
+	overlayHasContent := false
+
 	// clearOverlayDirty clears the overlay texture regions accumulated in
 	// overlayDirtyRects and resets the slice.
 	//
@@ -793,6 +822,7 @@ func mainLoop(hostPort, domain, user, password string, width, height int, swapAl
 		if dirtyArea*2 > width*height {
 			// Tier 1: one GPU upload clears the entire overlay texture.
 			texture.Update(nil, unsafe.Pointer(&overlayZero[0]), width*4)
+			overlayHasContent = false // entire texture is now transparent
 		} else if len(overlayDirtyRects) > 1 {
 			// Tier 2: compute bounding rect, lock once, zero dirty regions in Go.
 			r0 := overlayDirtyRects[0]
@@ -1232,6 +1262,7 @@ func mainLoop(hostPort, domain, user, password string, width, height int, swapAl
 		lastServerActivity.Store(0)
 		connectionErrorPending.Store(false)
 		overlayDirtyRects = overlayDirtyRects[:0]
+		overlayHasContent = false
 		texture.Destroy()
 		var rerr error
 		texture, rerr = renderer.CreateTexture(uint32(sdl.PIXELFORMAT_BGRA32), sdl.TEXTUREACCESS_STREAMING, w, h)
@@ -1461,7 +1492,11 @@ func mainLoop(hostPort, domain, user, password string, width, height int, swapAl
 			}
 		}
 		if len(allBitmaps) > 0 {
+			prevLen := len(overlayDirtyRects)
 			paintImages(allBitmaps, texture, width, height, &overlayDirtyRects)
+			if len(overlayDirtyRects) > prevLen {
+				overlayHasContent = true
+			}
 			for i := range allBitmaps {
 				bitmapBufPool.Put(allBitmaps[i].Data)
 			}
@@ -1485,11 +1520,11 @@ func mainLoop(hostPort, domain, user, password string, width, height int, swapAl
 				renderer.Copy(yuvTexture, nil, nil)
 			}
 			// Skip the overlay copy when the texture is fully transparent —
-			// clearOverlayDirty() has already zeroed every dirty rect, so
-			// overlayDirtyRects being empty means there is no bitmap content to
-			// blend.  In bitmap-only sessions (!yuvReady) we always copy because
-			// the overlay holds all visible content.
-			if len(overlayDirtyRects) > 0 || !yuvReady {
+			// overlayHasContent tracks whether any bitmap patch has been painted
+			// since the last full-texture clear (Tier-1 clearOverlayDirty or
+			// reconnect).  In bitmap-only sessions (!yuvReady) we always copy
+			// because the overlay holds all visible content.
+			if overlayHasContent || !yuvReady {
 				renderer.Copy(texture, nil, nil)
 			}
 			renderer.Present()
