@@ -641,10 +641,15 @@ func mainLoop(hostPort, domain, user, password string, width, height int, swapAl
 	overlayDirtyRects := make([]sdl.Rect, 0, 64)
 
 	// clearOverlayDirty clears the overlay texture regions accumulated in
-	// overlayDirtyRects and resets the slice.  The break-even between individual
-	// SDL_UpdateTexture calls (one GPU blit each) and a single full-texture
-	// upload is determined by area: if the total dirty area exceeds half the
-	// texture, a single upload is cheaper.
+	// overlayDirtyRects and resets the slice.
+	//
+	// Three tiers:
+	//   1. Total dirty area > half screen → one full-texture SDL_UpdateTexture (1 cgo).
+	//   2. Multiple dirty rects            → lock bounding rect once, zero each dirty
+	//                                        region in Go, unlock (2 cgo calls instead
+	//                                        of N SDL_UpdateTexture calls).
+	//   3. Single dirty rect               → one SDL_UpdateTexture (1 cgo, minimal GPU
+	//                                        upload; Lock would cost the same).
 	clearOverlayDirty := func() {
 		if len(overlayDirtyRects) == 0 {
 			return
@@ -654,12 +659,41 @@ func mainLoop(hostPort, domain, user, password string, width, height int, swapAl
 			dirtyArea += int(r.W) * int(r.H)
 		}
 		if dirtyArea*2 > width*height {
-			// Batch path: one GPU upload clears the entire overlay texture.
+			// Tier 1: one GPU upload clears the entire overlay texture.
 			texture.Update(nil, unsafe.Pointer(&overlayZero[0]), width*4)
-		} else {
-			for i := range overlayDirtyRects {
-				texture.Update(&overlayDirtyRects[i], unsafe.Pointer(&overlayZero[0]), width*4)
+		} else if len(overlayDirtyRects) > 1 {
+			// Tier 2: compute bounding rect, lock once, zero dirty regions in Go.
+			r0 := overlayDirtyRects[0]
+			bx0, by0 := int(r0.X), int(r0.Y)
+			bx1, by1 := bx0+int(r0.W), by0+int(r0.H)
+			for _, r := range overlayDirtyRects[1:] {
+				bx0 = min(bx0, int(r.X))
+				by0 = min(by0, int(r.Y))
+				bx1 = max(bx1, int(r.X)+int(r.W))
+				by1 = max(by1, int(r.Y)+int(r.H))
 			}
+			lockRect := sdl.Rect{X: int32(bx0), Y: int32(by0), W: int32(bx1 - bx0), H: int32(by1 - by0)}
+			if pixels, pitch, err := texture.Lock(&lockRect); err == nil {
+				for _, r := range overlayDirtyRects {
+					rx := int(r.X) - bx0
+					ry := int(r.Y) - by0
+					rw := int(r.W)
+					rh := int(r.H)
+					for row := range rh {
+						off := (ry+row)*pitch + rx*4
+						clear(pixels[off : off+rw*4])
+					}
+				}
+				texture.Unlock()
+			} else {
+				// Lock failed: fall back to individual SDL_UpdateTexture calls.
+				for i := range overlayDirtyRects {
+					texture.Update(&overlayDirtyRects[i], unsafe.Pointer(&overlayZero[0]), width*4)
+				}
+			}
+		} else {
+			// Tier 3: single dirty rect — one SDL_UpdateTexture is optimal.
+			texture.Update(&overlayDirtyRects[0], unsafe.Pointer(&overlayZero[0]), width*4)
 		}
 		overlayDirtyRects = overlayDirtyRects[:0]
 	}
