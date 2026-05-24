@@ -82,8 +82,9 @@ func paintImages(bs []grdp.Bitmap, texture *sdl.Texture, dirtyRects *[]sdl.Rect)
 			// Use the smaller of the destination rectangle and the actual
 			// image dimensions (same clamping as before).
 			img := bm.RGBA()
-			w := min(bm.DestRight-bm.DestLeft+1, img.Bounds().Dx())
-			h := min(bm.DestBottom-bm.DestTop+1, img.Bounds().Dy())
+			bounds := img.Bounds()
+			w := min(bm.DestRight-bm.DestLeft+1, bounds.Dx())
+			h := min(bm.DestBottom-bm.DestTop+1, bounds.Dy())
 			p := img.Pix
 			for i := 0; i < len(p); i += 4 {
 				p[i], p[i+2] = p[i+2], p[i]
@@ -389,7 +390,7 @@ func isNullYUVFrame(y, chroma []byte) bool {
 	return true
 }
 
-func mainLoop(hostPort, domain, user, password string, width, height int, swap_alt_meta bool, keyboardType, keyboardLayout string) (err error) {
+func mainLoop(hostPort, domain, user, password string, width, height int, swapAltMeta bool, keyboardType, keyboardLayout string) (err error) {
 	cursorCache := make(map[uint16]*sdl.Cursor)
 	showCursor := true
 
@@ -573,27 +574,18 @@ func mainLoop(hostPort, domain, user, password string, width, height int, swap_a
 			return nil
 		}
 		ph := (th + 1) / 2
-		var bufLen int
+		yLen := pitch * th
+		var all []byte
 		if format == sdlPixelFormatNV12 {
-			yLen := pitch * th
-			uvLen := pitch * ph
-			bufLen = yLen + uvLen
-			all := unsafe.Slice(&pixels[0], bufLen)
-			if initChroma {
-				fillBytes(all[yLen:], 128)
-			}
-			return &yuvStage{all: all, pitch: pitch, tw: tw, th: th}
+			all = unsafe.Slice(&pixels[0], yLen+pitch*ph)
 		} else {
 			uPitch := (pitch + 1) / 2
-			yLen := pitch * th
-			uvLen := uPitch * ph
-			bufLen = yLen + 2*uvLen
-			all := unsafe.Slice(&pixels[0], bufLen)
-			if initChroma {
-				fillBytes(all[yLen:], 128)
-			}
-			return &yuvStage{all: all, pitch: pitch, tw: tw, th: th}
+			all = unsafe.Slice(&pixels[0], yLen+2*uPitch*ph)
 		}
+		if initChroma {
+			fillBytes(all[yLen:], 128)
+		}
+		return &yuvStage{all: all, pitch: pitch, tw: tw, th: th}
 	}
 
 	// drainPreLock ensures yuvTexture is unlocked before destroying or
@@ -788,11 +780,9 @@ func mainLoop(hostPort, domain, user, password string, width, height int, swap_a
 			for i := range n {
 				b, g, r := data[3*i], data[3*i+1], data[3*i+2]
 				// Branchless alpha: 0x00 when all channels are zero, 0xFF otherwise.
-				// This avoids a conditional branch that would inhibit auto-vectorisation.
-				var a byte
-				if b|g|r != 0 {
-					a = 0xFF
-				}
+				// (uint(b|g|r) + 255) >> 8 yields 0 for zero input, 1 for any nonzero
+				// byte; multiplying by 255 saturates to 0xFF — no branch, no CMOV.
+				a := byte(((uint(b|g|r) + 255) >> 8) * 255)
 				rgba[4*i], rgba[4*i+1], rgba[4*i+2], rgba[4*i+3] = b, g, r, a
 			}
 			data = rgba
@@ -938,10 +928,10 @@ func mainLoop(hostPort, domain, user, password string, width, height int, swap_a
 						// corruption when the frame is smaller than the texture.
 						yBaseLen := stage.pitch * stage.th
 						uPitch := (stage.pitch + 1) / 2
-						ph_tex := (stage.th + 1) / 2
+						phTex := (stage.th + 1) / 2
 						uvLen := uPitch * ph
-						uBaseLen := yBaseLen + uPitch*ph_tex
-						vBaseLen := uBaseLen + uPitch*ph_tex
+						uBaseLen := yBaseLen + uPitch*phTex
+						vBaseLen := uBaseLen + uPitch*phTex
 						fastPath := stage.pitch == yStride && uPitch == uStride && destX == 0 && destY == 0
 						fullTexture := fastPath && h == stage.th
 						isNull := isNullYUVFrame(y, u)
@@ -1120,7 +1110,7 @@ func mainLoop(hostPort, domain, user, password string, width, height int, swap_a
 				}
 
 			case *sdl.KeyboardEvent:
-				k := transKey(t.Keysym.Scancode, swap_alt_meta)
+				k := transKey(t.Keysym.Scancode, swapAltMeta)
 				if t.State == sdl.RELEASED {
 					rdpClient.KeyUp(k)
 				} else if t.State == sdl.PRESSED {
@@ -1362,8 +1352,8 @@ func mainLoop(hostPort, domain, user, password string, width, height int, swap_a
 	return err
 }
 
-func transKey(scancode sdl.Scancode, trans_alt_meta bool) int {
-	if trans_alt_meta {
+func transKey(scancode sdl.Scancode, transAltMeta bool) int {
+	if transAltMeta {
 		if scancode == 0xE2 || scancode == 0xe6 {
 			scancode += 1
 		} else if scancode == 0xe3 || scancode == 0xE7 {
@@ -1496,7 +1486,7 @@ func main() {
 	// handler := slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelDebug})
 	// slog.SetDefault(slog.New(handler))
 
-	swap_alt_meta := flag.Bool("swap-alt-meta", false, "swap alt and meta key")
+	swapAltMeta := flag.Bool("swap-alt-meta", false, "swap alt and meta key")
 	debugLog := flag.Bool("debug", false, "enable debug logging")
 	flag.Parse()
 
@@ -1504,7 +1494,7 @@ func main() {
 		handler := slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelDebug})
 		slog.SetDefault(slog.New(handler))
 	}
-	slog.Debug("flag", "swap_alt_meta", *swap_alt_meta, "debug", *debugLog)
+	slog.Debug("flag", "swap_alt_meta", *swapAltMeta, "debug", *debugLog)
 
 	hostPort := strings.Join([]string{os.Getenv("GRDP_HOST"), os.Getenv("GRDP_PORT")}, ":")
 	domain := os.Getenv("GRDP_DOMAIN")
@@ -1518,5 +1508,5 @@ func main() {
 		width, height = 1280, 800
 	}
 
-	mainLoop(hostPort, domain, user, password, width, height, *swap_alt_meta, keyboardType, keyboardLayout)
+	mainLoop(hostPort, domain, user, password, width, height, *swapAltMeta, keyboardType, keyboardLayout)
 }
