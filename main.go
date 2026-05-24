@@ -72,6 +72,9 @@ func paintImages(bs []grdp.Bitmap, texture *sdl.Texture, dirtyRects *[]sdl.Rect)
 		// are uncommon outside of traditional RDP bitmap updates.
 		if bm.BitsPerPixel == 4 {
 			// Fast path: BGRA data passes straight to the BGRA32 texture.
+			if len(bm.Data) == 0 {
+				continue
+			}
 			w := min(bm.DestRight-bm.DestLeft+1, bm.Width)
 			h := min(bm.DestBottom-bm.DestTop+1, bm.Height)
 			rect := sdl.Rect{X: int32(bm.DestLeft), Y: int32(bm.DestTop), W: int32(w), H: int32(h)}
@@ -82,6 +85,9 @@ func paintImages(bs []grdp.Bitmap, texture *sdl.Texture, dirtyRects *[]sdl.Rect)
 			// Use the smaller of the destination rectangle and the actual
 			// image dimensions (same clamping as before).
 			img := bm.RGBA()
+			if len(img.Pix) == 0 {
+				continue
+			}
 			bounds := img.Bounds()
 			w := min(bm.DestRight-bm.DestLeft+1, bounds.Dx())
 			h := min(bm.DestBottom-bm.DestTop+1, bounds.Dy())
@@ -558,7 +564,9 @@ func mainLoop(hostPort, domain, user, password string, width, height int, swapAl
 	// yuvStageCh carries the pre-locked staging buffer from the main goroutine
 	// to H.264 callbacks; yuvDoneCh signals back when a frame has been written.
 	// Capacity 1 each: at most one frame is in flight at any time.
-	yuvStageCh := make(chan *yuvStage, 1)
+	// yuvStage is passed by value so the channel stores the struct inline,
+	// avoiding a heap allocation on every frame.
+	yuvStageCh := make(chan yuvStage, 1)
 	yuvDoneCh := make(chan yuvDone, 1)
 	var yuvWriteWg sync.WaitGroup // counts H.264 writes currently in progress
 
@@ -575,10 +583,10 @@ func mainLoop(hostPort, domain, user, password string, width, height int, swapAl
 	// (neutral 128) instead of green (Y=0,UV=0 is not a valid black in BT.601).
 	// Metal's staging MTLBuffer pool may return a freshly zeroed buffer on each
 	// lock, so we cannot rely on previous-frame data in unwritten UV regions.
-	preLockYUV := func(tex *sdl.Texture, tw, th int, format uint32, initChroma bool) *yuvStage {
+	preLockYUV := func(tex *sdl.Texture, tw, th int, format uint32, initChroma bool) (yuvStage, bool) {
 		pixels, pitch, err := tex.Lock(nil)
 		if err != nil {
-			return nil
+			return yuvStage{}, false
 		}
 		ph := (th + 1) / 2
 		yLen := pitch * th
@@ -592,7 +600,7 @@ func mainLoop(hostPort, domain, user, password string, width, height int, swapAl
 		if initChroma {
 			fillBytes(all[yLen:], 128)
 		}
-		return &yuvStage{all: all, pitch: pitch, tw: tw, th: th}
+		return yuvStage{all: all, pitch: pitch, tw: tw, th: th}, true
 	}
 
 	// drainPreLock ensures yuvTexture is unlocked before destroying or
@@ -619,7 +627,7 @@ func mainLoop(hostPort, domain, user, password string, width, height int, swapAl
 	// the code automatically degrades to the pool-buffer fallback path.
 	yuvPrimaryPath := false
 	if yuvTexture != nil {
-		if stage := preLockYUV(yuvTexture, width, height, yuvTextureFormat, true); stage != nil {
+		if stage, ok := preLockYUV(yuvTexture, width, height, yuvTextureFormat, true); ok {
 			yuvPrimaryPath = true
 			yuvStageCh <- stage
 		}
@@ -1072,7 +1080,7 @@ func mainLoop(hostPort, domain, user, password string, width, height int, swapAl
 				yuvPrimaryPath = false
 			} else {
 				initYUVBlack(yuvTexture, int(w), int(h), yuvTextureFormat)
-				if stage := preLockYUV(yuvTexture, int(w), int(h), yuvTextureFormat, true); stage != nil {
+				if stage, ok := preLockYUV(yuvTexture, int(w), int(h), yuvTextureFormat, true); ok {
 					yuvPrimaryPath = true
 					yuvStageCh <- stage
 				} else {
@@ -1093,15 +1101,13 @@ func mainLoop(hostPort, domain, user, password string, width, height int, swapAl
 	var resizeW, resizeH int32
 
 	for !quit {
-		// Use a short timeout during active rendering so new frames are picked up
-		// quickly.  When idle (renderDirty == 0) extend to 50 ms — H.264 and
-		// bitmap callbacks wake the loop via sdl.PushEvent, and SDL input events
-		// (keyboard/mouse) also wake it immediately, so responsiveness is unchanged.
-		waitMs := 50
-		if renderDirty > 0 {
-			waitMs = 8
-		}
-		event := sdl.WaitEventTimeout(waitMs)
+		// Always use a 50 ms timeout.  H.264 and bitmap callbacks push a wake
+		// event via sdl.PushEvent, so WaitEventTimeout returns near-immediately
+		// when new content arrives regardless of the timeout value.
+		// The short 8 ms polling previously used during renderDirty > 0 was
+		// redundant: wake events already drive timely rendering, and the
+		// extra CPU burn from 125 Hz busy-polling was the main idle CPU cost.
+		event := sdl.WaitEventTimeout(50)
 
 		// Coalesce mouse-motion events: only the final position in each tick
 		// is sent to the server, eliminating redundant RDP mouse-move packets.
@@ -1137,7 +1143,7 @@ func mainLoop(hostPort, domain, user, password string, width, height int, swapAl
 				if t.State == sdl.PRESSED {
 					rdpClient.MouseDown(int(t.Button)-1, int(t.X), int(t.Y))
 				} else {
-					rdpClient.MouseUp(int(t.Button-1), int(t.X), int(t.Y))
+					rdpClient.MouseUp(int(t.Button)-1, int(t.X), int(t.Y))
 				}
 
 			case *sdl.MouseWheelEvent:
@@ -1162,12 +1168,18 @@ func mainLoop(hostPort, domain, user, password string, width, height int, swapAl
 			rdpClient.MouseMove(lastMouseX, lastMouseY)
 		}
 
+		// Snapshot current time once for all time-based checks in this iteration,
+		// avoiding redundant time.Now() syscalls (congestion hint, resize debounce,
+		// stall watchdog — up to 4 calls reduced to 1).
+		now := time.Now()
+		nowNs := now.UnixNano()
+
 		// Update queueDepth congestion hint every loop iteration so the server
 		// reduces H.264 quality while we are dropping frames.  This fires even
 		// when all frames are dropped (yuvDoneCh / yuvCh never fire), which is
 		// the most important case to signal.
 		if dropNs := lastH264DropNs.Load(); dropNs != 0 {
-			if time.Since(time.Unix(0, dropNs)) < h264DropCooldown {
+			if nowNs-dropNs < int64(h264DropCooldown) {
 				rdpClient.SetQueueDepthHint(h264CongestionHint)
 			} else {
 				lastH264DropNs.Store(0)
@@ -1200,7 +1212,7 @@ func mainLoop(hostPort, domain, user, password string, width, height int, swapAl
 				// fringes (UV=0 ≈ RGB(0,136,0) in BT.601) in unwritten regions.
 				// After a null frame, always reinit (chroma must be set to 128).
 				needsChromaInit := !done.fullTexture || done.isNull
-				if stage := preLockYUV(yuvTexture, width, height, yuvTextureFormat, needsChromaInit); stage != nil {
+				if stage, ok := preLockYUV(yuvTexture, width, height, yuvTextureFormat, needsChromaInit); ok {
 					select {
 					case yuvStageCh <- stage:
 					default:
@@ -1259,30 +1271,35 @@ func mainLoop(hostPort, domain, user, password string, width, height int, swapAl
 			}
 		}
 
-	// Drain at most maxBitmapBatchesPerTick batches per render tick so that
-	// a burst of updates from the server (e.g. VirtualBox) does not accumulate
-	// all GPU texture writes into a single blocking spike.  Any remaining
-	// batches stay in bitmapCh and are processed in the next iteration.
-	for range maxBitmapBatchesPerTick {
-		select {
-		case bs := <-bitmapCh:
-			paintImages(bs, texture, &overlayDirtyRects)
-			for i := range bs {
-				bitmapBufPool.Put(bs[i].Data)
+		// Drain at most maxBitmapBatchesPerTick batches per render tick so that
+		// a burst of updates from the server (e.g. VirtualBox) does not accumulate
+		// all GPU texture writes into a single blocking spike.  Any remaining
+		// batches stay in bitmapCh and are processed in the next iteration.
+		for range maxBitmapBatchesPerTick {
+			select {
+			case bs := <-bitmapCh:
+				paintImages(bs, texture, &overlayDirtyRects)
+				for i := range bs {
+					bitmapBufPool.Put(bs[i].Data)
+				}
+				renderDirty = 3
+			default:
 			}
-			renderDirty = 3
-		default:
 		}
-	}
+
 		// Render only when content has changed.  renderDirty counts down so that
 		// every backbuffer is refreshed before we pause (SDL2 double/triple
 		// buffering requires re-issuing the same draw commands until all buffers
 		// are updated, otherwise a stale empty backbuffer flashes through).
 		if renderDirty > 0 {
-			// Clear to black first so the uninitialized renderer background (which
-			// shows through the initially-transparent BGRA overlay) is not visible.
-			renderer.SetDrawColor(0, 0, 0, 255)
-			renderer.Clear()
+			// Skip Clear when the YUV texture provides a full-screen base layer:
+			// renderer.Copy(yuvTexture, nil, nil) fills every pixel, making the
+			// prior Clear a wasted GPU command.  Clear is still needed for
+			// bitmap-only sessions and when the last decoded frame was null/missing.
+			if !yuvReady || yuvTextureIsNull {
+				renderer.SetDrawColor(0, 0, 0, 255)
+				renderer.Clear()
+			}
 			if yuvReady && !yuvTextureIsNull {
 				renderer.Copy(yuvTexture, nil, nil)
 			}
@@ -1316,7 +1333,7 @@ func mainLoop(hostPort, domain, user, password string, width, height int, swapAl
 		default:
 		}
 
-		if resizePending && time.Since(resizeTime) > 500*time.Millisecond {
+		if resizePending && now.Sub(resizeTime) > 500*time.Millisecond {
 			resizePending = false
 			slog.Info("Window resized, reconnecting", "width", resizeW, "height", resizeH)
 			reconnecting.Store(1)
@@ -1347,7 +1364,7 @@ func mainLoop(hostPort, domain, user, password string, width, height int, swapAl
 		// (the remote desktop may legitimately be idle for long periods).
 		lastNS := lastServerActivity.Load()
 		if lastNS != 0 && !resizePending {
-			elapsed := time.Since(time.Unix(0, lastNS))
+			elapsed := time.Duration(nowNs - lastNS)
 			if elapsed > videoStallTimeout {
 				if connectionErrorPending.CompareAndSwap(true, false) {
 					w, h := window.GetSize()
@@ -1364,7 +1381,7 @@ func mainLoop(hostPort, domain, user, password string, width, height int, swapAl
 					}
 				} else {
 					slog.Warn("Video stalled", "stalled", elapsed.Round(time.Millisecond))
-					lastServerActivity.Store(time.Now().UnixNano()) // reset to avoid repeated log spam
+					lastServerActivity.Store(nowNs) // reset to avoid repeated log spam
 				}
 			}
 		}
@@ -1390,118 +1407,121 @@ func transKey(scancode sdl.Scancode, transAltMeta bool) int {
 		}
 	}
 
-	if v, ok := scancodeMap[scancode]; ok {
-		return v
+	if int(scancode) < len(scancodeTable) {
+		return scancodeTable[scancode]
 	}
 	return 0
 }
 
-var scancodeMap = map[sdl.Scancode]int{
-	sdl.SCANCODE_UNKNOWN:      0x0000,
-	sdl.SCANCODE_ESCAPE:       0x0001,
-	sdl.SCANCODE_1:            0x0002,
-	sdl.SCANCODE_2:            0x0003,
-	sdl.SCANCODE_3:            0x0004,
-	sdl.SCANCODE_4:            0x0005,
-	sdl.SCANCODE_5:            0x0006,
-	sdl.SCANCODE_6:            0x0007,
-	sdl.SCANCODE_7:            0x0008,
-	sdl.SCANCODE_8:            0x0009,
-	sdl.SCANCODE_9:            0x000A,
-	sdl.SCANCODE_0:            0x000B,
-	sdl.SCANCODE_MINUS:        0x000C,
-	sdl.SCANCODE_EQUALS:       0x000D,
-	sdl.SCANCODE_BACKSPACE:    0x000E,
-	sdl.SCANCODE_TAB:          0x000F,
-	sdl.SCANCODE_Q:            0x0010,
-	sdl.SCANCODE_W:            0x0011,
-	sdl.SCANCODE_E:            0x0012,
-	sdl.SCANCODE_R:            0x0013,
-	sdl.SCANCODE_T:            0x0014,
-	sdl.SCANCODE_Y:            0x0015,
-	sdl.SCANCODE_U:            0x0016,
-	sdl.SCANCODE_I:            0x0017,
-	sdl.SCANCODE_O:            0x0018,
-	sdl.SCANCODE_P:            0x0019,
-	sdl.SCANCODE_LEFTBRACKET:  0x001A,
-	sdl.SCANCODE_RIGHTBRACKET: 0x001B,
-	sdl.SCANCODE_RETURN:       0x001C,
-	sdl.SCANCODE_LCTRL:        0x001D,
-	sdl.SCANCODE_A:            0x001E,
-	sdl.SCANCODE_S:            0x001F,
-	sdl.SCANCODE_D:            0x0020,
-	sdl.SCANCODE_F:            0x0021,
-	sdl.SCANCODE_G:            0x0022,
-	sdl.SCANCODE_H:            0x0023,
-	sdl.SCANCODE_J:            0x0024,
-	sdl.SCANCODE_K:            0x0025,
-	sdl.SCANCODE_L:            0x0026,
-	sdl.SCANCODE_SEMICOLON:    0x0027,
-	sdl.SCANCODE_APOSTROPHE:   0x0028,
-	sdl.SCANCODE_GRAVE:        0x0029,
-	sdl.SCANCODE_LSHIFT:       0x002A,
-	sdl.SCANCODE_BACKSLASH:    0x002B,
-	sdl.SCANCODE_Z:            0x002C,
-	sdl.SCANCODE_X:            0x002D,
-	sdl.SCANCODE_C:            0x002E,
-	sdl.SCANCODE_V:            0x002F,
-	sdl.SCANCODE_B:            0x0030,
-	sdl.SCANCODE_N:            0x0031,
-	sdl.SCANCODE_M:            0x0032,
-	sdl.SCANCODE_COMMA:        0x0033,
-	sdl.SCANCODE_PERIOD:       0x0034,
-	sdl.SCANCODE_SLASH:        0x0035,
-	sdl.SCANCODE_RSHIFT:       0x0036,
-	sdl.SCANCODE_KP_MULTIPLY:  0x0037,
-	sdl.SCANCODE_LALT:         0x0038,
-	sdl.SCANCODE_SPACE:        0x0039,
-	sdl.SCANCODE_CAPSLOCK:     0x003A,
-	sdl.SCANCODE_F1:           0x003B,
-	sdl.SCANCODE_F2:           0x003C,
-	sdl.SCANCODE_F3:           0x003D,
-	sdl.SCANCODE_F4:           0x003E,
-	sdl.SCANCODE_F5:           0x003F,
-	sdl.SCANCODE_F6:           0x0040,
-	sdl.SCANCODE_F7:           0x0041,
-	sdl.SCANCODE_F8:           0x0042,
-	sdl.SCANCODE_F9:           0x0043,
-	sdl.SCANCODE_F10:          0x0044,
-	// sdl.SCANCODE_PAUSE:        0x0045,
-	sdl.SCANCODE_SCROLLLOCK:   0x0046,
-	sdl.SCANCODE_KP_7:         0x0047,
-	sdl.SCANCODE_KP_8:         0x0048,
-	sdl.SCANCODE_KP_9:         0x0049,
-	sdl.SCANCODE_KP_MINUS:     0x004A,
-	sdl.SCANCODE_KP_4:         0x004B,
-	sdl.SCANCODE_KP_5:         0x004C,
-	sdl.SCANCODE_KP_6:         0x004D,
-	sdl.SCANCODE_KP_PLUS:      0x004E,
-	sdl.SCANCODE_KP_1:         0x004F,
-	sdl.SCANCODE_KP_2:         0x0050,
-	sdl.SCANCODE_KP_3:         0x0051,
-	sdl.SCANCODE_KP_0:         0x0052,
-	sdl.SCANCODE_KP_DECIMAL:   0x0053,
-	sdl.SCANCODE_F11:          0x0057,
-	sdl.SCANCODE_F12:          0x0058,
-	sdl.SCANCODE_KP_EQUALS:    0x0059,
-	sdl.SCANCODE_KP_ENTER:     0xE01C,
-	sdl.SCANCODE_RCTRL:        0xE01D,
-	sdl.SCANCODE_KP_DIVIDE:    0xE035,
-	sdl.SCANCODE_PRINTSCREEN:  0xE037,
-	sdl.SCANCODE_RALT:         0xE038,
-	sdl.SCANCODE_NUMLOCKCLEAR: 0xE045,
-	sdl.SCANCODE_PAUSE:        0xE046,
-	sdl.SCANCODE_HOME:         0xE047,
-	sdl.SCANCODE_UP:           0xE048,
-	sdl.SCANCODE_PAGEUP:       0xE049,
-	sdl.SCANCODE_LEFT:         0xE04B,
-	sdl.SCANCODE_RIGHT:        0xE04D,
-	sdl.SCANCODE_END:          0xE04F,
-	sdl.SCANCODE_DOWN:         0xE050,
-	sdl.SCANCODE_PAGEDOWN:     0xE051,
-	sdl.SCANCODE_INSERT:       0xE052,
-	sdl.SCANCODE_DELETE:       0xE053,
-	sdl.SCANCODE_MENU:         0xE05D,
+// scancodeTable maps SDL2 scancode integers (0–511) to RDP scancode values.
+// Direct array indexing avoids hash computation on every key event.
+var scancodeTable [512]int
+
+func init() {
+	scancodeTable[sdl.SCANCODE_UNKNOWN] = 0x0000
+	scancodeTable[sdl.SCANCODE_ESCAPE] = 0x0001
+	scancodeTable[sdl.SCANCODE_1] = 0x0002
+	scancodeTable[sdl.SCANCODE_2] = 0x0003
+	scancodeTable[sdl.SCANCODE_3] = 0x0004
+	scancodeTable[sdl.SCANCODE_4] = 0x0005
+	scancodeTable[sdl.SCANCODE_5] = 0x0006
+	scancodeTable[sdl.SCANCODE_6] = 0x0007
+	scancodeTable[sdl.SCANCODE_7] = 0x0008
+	scancodeTable[sdl.SCANCODE_8] = 0x0009
+	scancodeTable[sdl.SCANCODE_9] = 0x000A
+	scancodeTable[sdl.SCANCODE_0] = 0x000B
+	scancodeTable[sdl.SCANCODE_MINUS] = 0x000C
+	scancodeTable[sdl.SCANCODE_EQUALS] = 0x000D
+	scancodeTable[sdl.SCANCODE_BACKSPACE] = 0x000E
+	scancodeTable[sdl.SCANCODE_TAB] = 0x000F
+	scancodeTable[sdl.SCANCODE_Q] = 0x0010
+	scancodeTable[sdl.SCANCODE_W] = 0x0011
+	scancodeTable[sdl.SCANCODE_E] = 0x0012
+	scancodeTable[sdl.SCANCODE_R] = 0x0013
+	scancodeTable[sdl.SCANCODE_T] = 0x0014
+	scancodeTable[sdl.SCANCODE_Y] = 0x0015
+	scancodeTable[sdl.SCANCODE_U] = 0x0016
+	scancodeTable[sdl.SCANCODE_I] = 0x0017
+	scancodeTable[sdl.SCANCODE_O] = 0x0018
+	scancodeTable[sdl.SCANCODE_P] = 0x0019
+	scancodeTable[sdl.SCANCODE_LEFTBRACKET] = 0x001A
+	scancodeTable[sdl.SCANCODE_RIGHTBRACKET] = 0x001B
+	scancodeTable[sdl.SCANCODE_RETURN] = 0x001C
+	scancodeTable[sdl.SCANCODE_LCTRL] = 0x001D
+	scancodeTable[sdl.SCANCODE_A] = 0x001E
+	scancodeTable[sdl.SCANCODE_S] = 0x001F
+	scancodeTable[sdl.SCANCODE_D] = 0x0020
+	scancodeTable[sdl.SCANCODE_F] = 0x0021
+	scancodeTable[sdl.SCANCODE_G] = 0x0022
+	scancodeTable[sdl.SCANCODE_H] = 0x0023
+	scancodeTable[sdl.SCANCODE_J] = 0x0024
+	scancodeTable[sdl.SCANCODE_K] = 0x0025
+	scancodeTable[sdl.SCANCODE_L] = 0x0026
+	scancodeTable[sdl.SCANCODE_SEMICOLON] = 0x0027
+	scancodeTable[sdl.SCANCODE_APOSTROPHE] = 0x0028
+	scancodeTable[sdl.SCANCODE_GRAVE] = 0x0029
+	scancodeTable[sdl.SCANCODE_LSHIFT] = 0x002A
+	scancodeTable[sdl.SCANCODE_BACKSLASH] = 0x002B
+	scancodeTable[sdl.SCANCODE_Z] = 0x002C
+	scancodeTable[sdl.SCANCODE_X] = 0x002D
+	scancodeTable[sdl.SCANCODE_C] = 0x002E
+	scancodeTable[sdl.SCANCODE_V] = 0x002F
+	scancodeTable[sdl.SCANCODE_B] = 0x0030
+	scancodeTable[sdl.SCANCODE_N] = 0x0031
+	scancodeTable[sdl.SCANCODE_M] = 0x0032
+	scancodeTable[sdl.SCANCODE_COMMA] = 0x0033
+	scancodeTable[sdl.SCANCODE_PERIOD] = 0x0034
+	scancodeTable[sdl.SCANCODE_SLASH] = 0x0035
+	scancodeTable[sdl.SCANCODE_RSHIFT] = 0x0036
+	scancodeTable[sdl.SCANCODE_KP_MULTIPLY] = 0x0037
+	scancodeTable[sdl.SCANCODE_LALT] = 0x0038
+	scancodeTable[sdl.SCANCODE_SPACE] = 0x0039
+	scancodeTable[sdl.SCANCODE_CAPSLOCK] = 0x003A
+	scancodeTable[sdl.SCANCODE_F1] = 0x003B
+	scancodeTable[sdl.SCANCODE_F2] = 0x003C
+	scancodeTable[sdl.SCANCODE_F3] = 0x003D
+	scancodeTable[sdl.SCANCODE_F4] = 0x003E
+	scancodeTable[sdl.SCANCODE_F5] = 0x003F
+	scancodeTable[sdl.SCANCODE_F6] = 0x0040
+	scancodeTable[sdl.SCANCODE_F7] = 0x0041
+	scancodeTable[sdl.SCANCODE_F8] = 0x0042
+	scancodeTable[sdl.SCANCODE_F9] = 0x0043
+	scancodeTable[sdl.SCANCODE_F10] = 0x0044
+	scancodeTable[sdl.SCANCODE_SCROLLLOCK] = 0x0046
+	scancodeTable[sdl.SCANCODE_KP_7] = 0x0047
+	scancodeTable[sdl.SCANCODE_KP_8] = 0x0048
+	scancodeTable[sdl.SCANCODE_KP_9] = 0x0049
+	scancodeTable[sdl.SCANCODE_KP_MINUS] = 0x004A
+	scancodeTable[sdl.SCANCODE_KP_4] = 0x004B
+	scancodeTable[sdl.SCANCODE_KP_5] = 0x004C
+	scancodeTable[sdl.SCANCODE_KP_6] = 0x004D
+	scancodeTable[sdl.SCANCODE_KP_PLUS] = 0x004E
+	scancodeTable[sdl.SCANCODE_KP_1] = 0x004F
+	scancodeTable[sdl.SCANCODE_KP_2] = 0x0050
+	scancodeTable[sdl.SCANCODE_KP_3] = 0x0051
+	scancodeTable[sdl.SCANCODE_KP_0] = 0x0052
+	scancodeTable[sdl.SCANCODE_KP_DECIMAL] = 0x0053
+	scancodeTable[sdl.SCANCODE_F11] = 0x0057
+	scancodeTable[sdl.SCANCODE_F12] = 0x0058
+	scancodeTable[sdl.SCANCODE_KP_EQUALS] = 0x0059
+	scancodeTable[sdl.SCANCODE_KP_ENTER] = 0xE01C
+	scancodeTable[sdl.SCANCODE_RCTRL] = 0xE01D
+	scancodeTable[sdl.SCANCODE_KP_DIVIDE] = 0xE035
+	scancodeTable[sdl.SCANCODE_PRINTSCREEN] = 0xE037
+	scancodeTable[sdl.SCANCODE_RALT] = 0xE038
+	scancodeTable[sdl.SCANCODE_NUMLOCKCLEAR] = 0xE045
+	scancodeTable[sdl.SCANCODE_PAUSE] = 0xE046
+	scancodeTable[sdl.SCANCODE_HOME] = 0xE047
+	scancodeTable[sdl.SCANCODE_UP] = 0xE048
+	scancodeTable[sdl.SCANCODE_PAGEUP] = 0xE049
+	scancodeTable[sdl.SCANCODE_LEFT] = 0xE04B
+	scancodeTable[sdl.SCANCODE_RIGHT] = 0xE04D
+	scancodeTable[sdl.SCANCODE_END] = 0xE04F
+	scancodeTable[sdl.SCANCODE_DOWN] = 0xE050
+	scancodeTable[sdl.SCANCODE_PAGEDOWN] = 0xE051
+	scancodeTable[sdl.SCANCODE_INSERT] = 0xE052
+	scancodeTable[sdl.SCANCODE_DELETE] = 0xE053
+	scancodeTable[sdl.SCANCODE_MENU] = 0xE05D
 }
 
 func main() {
