@@ -1081,8 +1081,6 @@ func mainLoop(hostPort, domain, user, password string, width, height int, swap_a
 	var resizePending bool
 	var resizeTime time.Time
 	var resizeW, resizeH int32
-	var lastClipboardText string
-	lastClipboardCheck := time.Now()
 
 	for !quit {
 		// Use a short timeout during active rendering so new frames are picked up
@@ -1140,6 +1138,13 @@ func mainLoop(hostPort, domain, user, password string, width, height int, swap_a
 				if dy != 0 {
 					rdpClient.MouseWheel(float64(dy))
 				}
+
+			case *sdl.ClipboardEvent:
+				// SDL_CLIPBOARDUPDATE fires whenever the clipboard changes,
+				// including when we call sdl.SetClipboardText() ourselves
+				// (server → client path).  grdp's suppressNextLocalChange flag
+				// absorbs that self-notification, so no echo loop occurs.
+				rdpClient.NotifyClipboardChanged()
 			}
 		}
 
@@ -1281,13 +1286,13 @@ func mainLoop(hostPort, domain, user, password string, width, height int, swap_a
 			renderDirty--
 		}
 
-		// Handle clipboard from server (server → client)
+		// Handle clipboard from server (server → client).
+		// sdl.SetClipboardText() fires SDL_CLIPBOARDUPDATE, which the event loop
+		// above handles via NotifyClipboardChanged(); grdp's suppress flag
+		// prevents the echo from being forwarded back to the server.
 		select {
 		case text := <-clipboardFromServer:
 			sdl.SetClipboardText(text)
-			// Don't update lastClipboardText here so that the next poll
-			// detects the change and calls NotifyClipboardChanged(),
-			// which consumes grdp's suppressNextLocalChange flag.
 		default:
 		}
 
@@ -1297,15 +1302,6 @@ func mainLoop(hostPort, domain, user, password string, width, height int, swap_a
 			text, _ := sdl.GetClipboardText()
 			respCh <- text
 		default:
-		}
-
-		// Poll local clipboard changes
-		if time.Since(lastClipboardCheck) > time.Second {
-			lastClipboardCheck = time.Now()
-			if text, err := sdl.GetClipboardText(); err == nil && text != lastClipboardText {
-				lastClipboardText = text
-				rdpClient.NotifyClipboardChanged()
-			}
 		}
 
 		if resizePending && time.Since(resizeTime) > 500*time.Millisecond {
