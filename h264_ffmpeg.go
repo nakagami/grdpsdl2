@@ -1299,11 +1299,12 @@ const avcHWEarlyStallMinElapsed = 2 * time.Second
 // avcHWMidSessionNullFrameLimit is the null-frame count threshold used for
 // mid-session stall detection (hwSentCount >= avcHWEarlyFrameLimit).
 // Normal GOP / mid-session IDR boundaries produce at most ~25 null frames
-// (~1 s at 30 fps); a genuine VideoToolbox stall produces hundreds.  75
-// frames ≈ 2.5 s at 30 fps — well above normal GOP noise (25 frames, 3×
-// margin) while detecting genuine stalls ~2.5 s earlier than the previous
-// 150-frame threshold.
-const avcHWMidSessionNullFrameLimit = 75
+// (~1 s at 30 fps); a genuine VideoToolbox stall produces hundreds.  30
+// frames ≈ 1 s at 30 fps — safely above normal GOP noise (25 frames) while
+// detecting genuine stalls ~1.5 s earlier than the previous 75-frame
+// threshold.  Observed logs show zero mid-session null frames outside of
+// the fatal VT stall, so the 3× safety margin is not needed in practice.
+const avcHWMidSessionNullFrameLimit = 30
 
 // keyframeWaitLimit is the maximum number of non-IDR packets we drop while
 // waiting for a keyframe after a decoder reset or flush.  gnome-remote-desktop
@@ -1330,11 +1331,14 @@ const keyframeWaitTimeout = 15 * time.Second
 const keyframeWaitTimeoutSW = 5 * time.Second
 
 // keyframeWaitTimeoutSWFallback is the keyframe-wait timer for the main SW
-// fallback decoder (created after a VideoToolbox stall).  Extended to 3 s to
-// give the server a fair window to respond to the ForceRefresh keyframe request
-// before escalating further.  Combined with the separate noIDRSoftResetCount
-// budget, this allows one retry cycle (up to ~6 s total) before reconnecting.
-const keyframeWaitTimeoutSWFallback = 3 * time.Second
+// fallback decoder (created after a VideoToolbox stall).  Set to 1 s because
+// Windows Server in AVC444 mode does not send an IDR in response to
+// ForceRefresh (SuppressOutput toggle) — observed across multiple test runs
+// where 90+ frames arrived over 3 s with no IDR after ForceRefresh.  A 1 s
+// window is sufficient to catch the rare case where the server does respond
+// promptly; if no IDR arrives the code escalates directly to reconnect
+// (usingSWFallback skips the noIDRSoftResetCount retry).
+const keyframeWaitTimeoutSWFallback = 1 * time.Second
 
 // profileWindow is the number of HW frames over which Decode aggregates
 // timing measurements before logging an INFO summary.  At 30 fps this is
@@ -2243,10 +2247,10 @@ func (d *ffmpegDecoder) Decode(h264Data []byte) (*rdpgfx.H264Frame, error) {
 			//     avcHWNullFrameStallLimit (25).  Reduces visible freeze from
 			//     ~10 s to ~4 s for a genuine VT stall at session start.
 			//   • Mid-session (hwSentCount >= avcHWEarlyFrameLimit): use
-			//     avcHWMidSessionNullFrameLimit (150 ≈ 5 s at 30 fps).
+			//     avcHWMidSessionNullFrameLimit (30 ≈ 1 s at 30 fps).
 			//     Normal GOP boundaries produce ≤25 null frames so there is
-			//     comfortable headroom before the false-positive risk zone.
-			//     Reduces visible freeze from 7 s to ~5.5 s mid-session.
+			//     minimal headroom; genuine stalls persist for hundreds of
+			//     null frames.  Reduces visible freeze from ~2.5 s to ~1 s.
 			earlyStall := d.hwSentCount < avcHWEarlyFrameLimit &&
 				d.hwConsecNullFrames >= avcHWNullFrameStallLimit &&
 				!d.hwFirstSendTime.IsZero() &&
