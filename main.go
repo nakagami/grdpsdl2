@@ -411,6 +411,13 @@ func mainLoop(hostPort, domain, user, password string, width, height int, swapAl
 	// the callback/main-loop boundary.
 	var decoderBrokenPending atomic.Bool
 
+	// connectionErrorPending is set by OnError (TCP-level errors such as
+	// "connection reset by peer") and cleared after a successful reconnect.
+	// When the video watchdog detects a stall AND this flag is set, the main
+	// loop triggers a reconnect instead of just logging — preventing the
+	// session from staying black forever after a dropped connection.
+	var connectionErrorPending atomic.Bool
+
 	// eventPending prevents redundant SDL user-event pushes when H.264 or
 	// bitmap callbacks fire faster than the main loop drains them.  Using
 	// CompareAndSwap ensures at most one pending wake-up event sits in the
@@ -717,6 +724,10 @@ func mainLoop(hostPort, domain, user, password string, width, height int, swapAl
 			return
 		}
 		slog.Error("on error", "err", e)
+		connectionErrorPending.Store(true)
+		if bitmapEventType != sdl.FIRSTEVENT && eventPending.CompareAndSwap(false, true) {
+			sdl.PushEvent(wakeEvent)
+		}
 	}).OnReady(func() {
 		slog.Info("on ready")
 	}).OnAudio(func(af rdpsnd.AudioFormat, data []byte) {
@@ -1039,6 +1050,7 @@ func mainLoop(hostPort, domain, user, password string, width, height int, swapAl
 	// the resize-reconnect and video-stall-reconnect paths.
 	resetAfterReconnect := func(w, h int32) {
 		lastServerActivity.Store(0)
+		connectionErrorPending.Store(false)
 		overlayDirtyRects = overlayDirtyRects[:0]
 		texture.Destroy()
 		var rerr error
@@ -1330,13 +1342,30 @@ func mainLoop(hostPort, domain, user, password string, width, height int, swapAl
 			}
 		}
 
-		// Video watchdog: log when no server activity arrives for a while.
+		// Video watchdog: reconnect if a connection error was reported and the
+		// session has been silent for videoStallTimeout; otherwise just log
+		// (the remote desktop may legitimately be idle for long periods).
 		lastNS := lastServerActivity.Load()
 		if lastNS != 0 && !resizePending {
 			elapsed := time.Since(time.Unix(0, lastNS))
 			if elapsed > videoStallTimeout {
-				slog.Warn("Video stalled", "stalled", elapsed.Round(time.Millisecond))
-				lastServerActivity.Store(time.Now().UnixNano()) // reset to avoid repeated log spam
+				if connectionErrorPending.CompareAndSwap(true, false) {
+					w, h := window.GetSize()
+					slog.Warn("Video stalled after connection error, reconnecting",
+						"stalled", elapsed.Round(time.Millisecond), "width", w, "height", h)
+					reconnecting.Store(1)
+					reconnErr := rdpClient.Reconnect(int(w), int(h))
+					reconnecting.Store(0)
+					if reconnErr != nil {
+						slog.Error("Reconnect (stall) failed", "err", reconnErr)
+						connectionErrorPending.Store(true) // retry next stall cycle
+					} else {
+						resetAfterReconnect(w, h)
+					}
+				} else {
+					slog.Warn("Video stalled", "stalled", elapsed.Round(time.Millisecond))
+					lastServerActivity.Store(time.Now().UnixNano()) // reset to avoid repeated log spam
+				}
 			}
 		}
 		// Audio device recovery: play() sets reopenNeeded when SDL2 reports
