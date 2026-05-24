@@ -73,6 +73,7 @@ func paintImages(bs []grdp.Bitmap, texture *sdl.Texture, width, height int, dirt
 	// bitmaps, clamped to [0, width) × [0, height).
 	bx0, by0, bx1, by1 := width, height, 0, 0
 	fastCount := 0
+	totalBitmapArea := 0
 	for _, bm := range bs {
 		if bm.BitsPerPixel != 4 {
 			// Slow path: convert to RGBA, swap R↔B in-place, update texture.
@@ -110,6 +111,7 @@ func paintImages(bs []grdp.Bitmap, texture *sdl.Texture, width, height int, dirt
 			continue // entirely off-screen
 		}
 		fastCount++
+		totalBitmapArea += (x1 - x0) * (y1 - y0)
 		bx0 = min(bx0, x0)
 		by0 = min(by0, y0)
 		bx1 = max(bx1, x1)
@@ -140,6 +142,46 @@ func paintImages(bs []grdp.Bitmap, texture *sdl.Texture, width, height int, dirt
 
 	// Multiple fast-path patches: lock the bounding rect once and copy all
 	// rows in Go — two cgo calls instead of N SDL_UpdateTexture calls.
+	//
+	// On macOS/Metal SDL_LockTexture returns a new zero-initialised staging
+	// buffer, NOT the current texture content.  When the patches are sparse
+	// (i.e. they don't collectively cover most of the bounding rect), the
+	// uncovered pixels inside the lock rect are written as black, erasing the
+	// existing texture content in those areas.  Use the lock path only when
+	// the bitmaps cover at least 75% of the bounding rect; otherwise fall
+	// back to individual SDL_UpdateTexture calls, which are read-modify-write.
+	lockRectArea := (bx1 - bx0) * (by1 - by0)
+	useLockPath := lockRectArea > 0 && totalBitmapArea*4 >= lockRectArea*3 // fill ≥ 75%
+	if !useLockPath {
+		slog.Debug("paintImages: sparse bitmaps, using per-patch SDL_UpdateTexture",
+			"fastCount", fastCount,
+			"totalBitmapArea", totalBitmapArea,
+			"lockRectArea", lockRectArea,
+		)
+		for _, bm := range bs {
+			if bm.BitsPerPixel != 4 || len(bm.Data) == 0 {
+				continue
+			}
+			w := min(bm.DestRight-bm.DestLeft+1, bm.Width)
+			h := min(bm.DestBottom-bm.DestTop+1, bm.Height)
+			if w <= 0 || h <= 0 {
+				continue
+			}
+			x0 := max(bm.DestLeft, 0)
+			y0 := max(bm.DestTop, 0)
+			x1 := min(bm.DestLeft+w, width)
+			y1 := min(bm.DestTop+h, height)
+			if x1 <= x0 || y1 <= y0 {
+				continue
+			}
+			srcCol := x0 - bm.DestLeft
+			rect := sdl.Rect{X: int32(x0), Y: int32(y0), W: int32(x1 - x0), H: int32(y1 - y0)}
+			texture.Update(&rect, unsafe.Pointer(&bm.Data[srcCol*4]), bm.Width*4)
+			*dirtyRects = append(*dirtyRects, rect)
+		}
+		return
+	}
+
 	lockRect := sdl.Rect{X: int32(bx0), Y: int32(by0), W: int32(bx1 - bx0), H: int32(by1 - by0)}
 	pixels, pitch, err := texture.Lock(&lockRect)
 	if err != nil {
