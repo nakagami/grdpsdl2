@@ -78,10 +78,10 @@ func paintImages(bs []grdp.Bitmap, texture *sdl.Texture, width, height int, dirt
 			bounds := img.Bounds()
 			w := min(bm.DestRight-bm.DestLeft+1, bounds.Dx())
 			h := min(bm.DestBottom-bm.DestTop+1, bounds.Dy())
-			p := img.Pix
-			for i := 0; i < len(p); i += 4 {
-				p[i], p[i+2] = p[i+2], p[i]
-			}
+			// img.Pix is RGBA; the texture is BGRA32.  Swap R/B in place with
+			// the SIMD-accelerated batch converter (one vectorised pass) instead
+			// of a scalar per-byte loop.
+			grdp.SwapRB(img.Pix)
 			rect := sdl.Rect{X: int32(bm.DestLeft), Y: int32(bm.DestTop), W: int32(w), H: int32(h)}
 			texture.Update(&rect, unsafe.Pointer(&img.Pix[0]), img.Stride)
 			*dirtyRects = append(*dirtyRects, rect)
