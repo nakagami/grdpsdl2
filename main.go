@@ -69,21 +69,21 @@ func fillBytes(s []byte, v byte) {
 // Update as before.
 func paintImages(bs []grdp.Bitmap, texture *sdl.Texture, width, height int, dirtyRects *[]sdl.Rect) {
 	// First pass: handle slow-path (legacy bpp) bitmaps immediately.
+	// Reuse a single BGRA scratch buffer across patches to avoid repeated
+	// allocations for the common case of many same-sized tiles per frame.
+	var bgraBuf []byte
 	for _, bm := range bs {
 		if bm.BitsPerPixel != 4 {
-			img := bm.RGBA()
-			if len(img.Pix) == 0 {
+			// FillBGRA converts to packed BGRA32 in a single pass, reusing
+			// bgraBuf so no per-patch allocation is needed.
+			bgraBuf = bm.FillBGRA(bgraBuf)
+			if len(bgraBuf) == 0 {
 				continue
 			}
-			bounds := img.Bounds()
-			w := min(bm.DestRight-bm.DestLeft+1, bounds.Dx())
-			h := min(bm.DestBottom-bm.DestTop+1, bounds.Dy())
-			// img.Pix is RGBA; the texture is BGRA32.  Swap R/B in place with
-			// the SIMD-accelerated batch converter (one vectorised pass) instead
-			// of a scalar per-byte loop.
-			grdp.SwapRB(img.Pix)
+			w := min(bm.DestRight-bm.DestLeft+1, bm.Width)
+			h := min(bm.DestBottom-bm.DestTop+1, bm.Height)
 			rect := sdl.Rect{X: int32(bm.DestLeft), Y: int32(bm.DestTop), W: int32(w), H: int32(h)}
-			texture.Update(&rect, unsafe.Pointer(&img.Pix[0]), img.Stride)
+			texture.Update(&rect, unsafe.Pointer(&bgraBuf[0]), bm.Width*4)
 			*dirtyRects = append(*dirtyRects, rect)
 		}
 	}
@@ -162,8 +162,17 @@ func uploadYUVFrame(frame yuvFrame, texture *sdl.Texture, rect *sdl.Rect) {
 		// Extend the Y-only slice to cover the full NV12 MTLBuffer (Y + interleaved UV).
 		all := unsafe.Slice(&pixels[0], yLen+uvLen)
 		if pitch == frame.yStride {
-			copy(all[:yLen], frame.y[:yLen])
-			copy(all[yLen:yLen+uvLen], frame.uv[:uvLen])
+			total := yLen + uvLen
+			if total >= 256*256*4 {
+				var wg sync.WaitGroup
+				wg.Add(2)
+				go func() { defer wg.Done(); copy(all[:yLen], frame.y[:yLen]) }()
+				go func() { defer wg.Done(); copy(all[yLen:yLen+uvLen], frame.uv[:uvLen]) }()
+				wg.Wait()
+			} else {
+				copy(all[:yLen], frame.y[:yLen])
+				copy(all[yLen:yLen+uvLen], frame.uv[:uvLen])
+			}
 		} else {
 			w := frame.w
 			for row := 0; row < frame.h; row++ {
@@ -187,9 +196,19 @@ func uploadYUVFrame(frame yuvFrame, texture *sdl.Texture, rect *sdl.Rect) {
 		// Extend slice to cover Y + U + V planes.
 		all := unsafe.Slice(&pixels[0], yLen+uvLen+uvLen)
 		if pitch == frame.yStride && uPitch == frame.uStride {
-			copy(all[:yLen], frame.y[:yLen])
-			copy(all[yLen:yLen+uvLen], frame.u[:uvLen])
-			copy(all[yLen+uvLen:yLen+uvLen+uvLen], frame.v[:uvLen])
+			total := yLen + uvLen*2
+			if total >= 256*256*4 {
+				var wg sync.WaitGroup
+				wg.Add(3)
+				go func() { defer wg.Done(); copy(all[:yLen], frame.y[:yLen]) }()
+				go func() { defer wg.Done(); copy(all[yLen:yLen+uvLen], frame.u[:uvLen]) }()
+				go func() { defer wg.Done(); copy(all[yLen+uvLen:yLen+uvLen+uvLen], frame.v[:uvLen]) }()
+				wg.Wait()
+			} else {
+				copy(all[:yLen], frame.y[:yLen])
+				copy(all[yLen:yLen+uvLen], frame.u[:uvLen])
+				copy(all[yLen+uvLen:yLen+uvLen+uvLen], frame.v[:uvLen])
+			}
 		} else {
 			w := frame.w
 			hw := (frame.w + 1) / 2
@@ -950,8 +969,18 @@ func mainLoop(hostPort, domain, user, password string, width, height int, swapAl
 							// zeroed (UV=0); Y=0,UV=0 renders as green in BT.601.
 							fillBytes(stage.all[yBaseLen:], 128)
 						} else if fastPath {
-							copy(stage.all[:stage.pitch*h], y[:stage.pitch*h])
-							copy(stage.all[yBaseLen:yBaseLen+uvLen], uv[:uvLen])
+							yLen := stage.pitch * h
+							total := yLen + uvLen
+							if total >= 256*256*4 {
+								var wg sync.WaitGroup
+								wg.Add(2)
+								go func() { defer wg.Done(); copy(stage.all[:yLen], y[:yLen]) }()
+								go func() { defer wg.Done(); copy(stage.all[yBaseLen:yBaseLen+uvLen], uv[:uvLen]) }()
+								wg.Wait()
+							} else {
+								copy(stage.all[:yLen], y[:yLen])
+								copy(stage.all[yBaseLen:yBaseLen+uvLen], uv[:uvLen])
+							}
 						} else {
 							for row := range h {
 								dstOff := (destY+row)*stage.pitch + destX
@@ -1038,9 +1067,20 @@ func mainLoop(hostPort, domain, user, password string, width, height int, swapAl
 							// zeroed (UV=0); Y=0,UV=0 renders as green in BT.601.
 							fillBytes(stage.all[uBaseLen:], 128)
 						} else if fastPath {
-							copy(stage.all[:stage.pitch*h], y[:stage.pitch*h])
-							copy(stage.all[uBaseLen:uBaseLen+uvLen], u[:uvLen])
-							copy(stage.all[vBaseLen:vBaseLen+uvLen], v[:uvLen])
+							yLen := stage.pitch * h
+							total := yLen + uvLen*2
+							if total >= 256*256*4 {
+								var wg sync.WaitGroup
+								wg.Add(3)
+								go func() { defer wg.Done(); copy(stage.all[:yLen], y[:yLen]) }()
+								go func() { defer wg.Done(); copy(stage.all[uBaseLen:uBaseLen+uvLen], u[:uvLen]) }()
+								go func() { defer wg.Done(); copy(stage.all[vBaseLen:vBaseLen+uvLen], v[:uvLen]) }()
+								wg.Wait()
+							} else {
+								copy(stage.all[:yLen], y[:yLen])
+								copy(stage.all[uBaseLen:uBaseLen+uvLen], u[:uvLen])
+								copy(stage.all[vBaseLen:vBaseLen+uvLen], v[:uvLen])
+							}
 						} else {
 							w2 := (w + 1) / 2
 							for row := range h {
