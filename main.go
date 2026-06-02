@@ -950,43 +950,55 @@ func mainLoop(hostPort, domain, user, password string, width, height int, swapAl
 					select {
 					case stage := <-yuvStageCh:
 						defer yuvWriteWg.Done()
-						ph := (h + 1) / 2
 						// UV plane starts after ALL Y rows of the full texture,
 						// not just the frame rows.  Using stage.th (texture height)
 						// instead of h fixes corruption when the frame is smaller
 						// than the texture (e.g. a video window inside the desktop).
 						yBaseLen := stage.pitch * stage.th
-						uvLen := stage.pitch * ph
 						fastPath := stage.pitch == yStride && destX == 0 && destY == 0
 						// fullTexture: the frame covers the entire texture, so every
 						// Y and UV byte will be overwritten — the next lock can skip
 						// the UV pre-initialisation (saves ~1 MB memset per frame).
 						fullTexture := fastPath && h == stage.th
 						isNull := isNullYUVFrame(y, uv)
+						// Clip copy height to texture dimensions: H.264 aligns frame
+						// height to 16-pixel multiples (e.g. 1072 for a 1060-row
+						// display), so h may exceed stage.th.  Copying the extra rows
+						// would: (a) overflow the staging buffer (UV starts at
+						// stage.th, so Y rows beyond stage.th land in the UV region),
+						// and (b) in the parallel fast path, cause a data race between
+						// the Y and UV goroutines writing to the same buffer region
+						// [stage.th*pitch, h*pitch).
+						copyH := min(h, stage.th)
+						copyPh := (copyH + 1) / 2
 						if isNull {
 							// Fill UV with 128 (neutral chroma) so Unlock commits black
 							// instead of green.  Metal staging buffers may be freshly
 							// zeroed (UV=0); Y=0,UV=0 renders as green in BT.601.
 							fillBytes(stage.all[yBaseLen:], 128)
 						} else if fastPath {
-							yLen := stage.pitch * h
-							total := yLen + uvLen
+							yLen := stage.pitch * copyH
+							copyUVLen := stage.pitch * copyPh
+							total := yLen + copyUVLen
 							if total >= 256*256*4 {
 								var wg sync.WaitGroup
 								wg.Add(2)
 								go func() { defer wg.Done(); copy(stage.all[:yLen], y[:yLen]) }()
-								go func() { defer wg.Done(); copy(stage.all[yBaseLen:yBaseLen+uvLen], uv[:uvLen]) }()
+								go func() {
+									defer wg.Done()
+									copy(stage.all[yBaseLen:yBaseLen+copyUVLen], uv[:copyUVLen])
+								}()
 								wg.Wait()
 							} else {
 								copy(stage.all[:yLen], y[:yLen])
-								copy(stage.all[yBaseLen:yBaseLen+uvLen], uv[:uvLen])
+								copy(stage.all[yBaseLen:yBaseLen+copyUVLen], uv[:copyUVLen])
 							}
 						} else {
-							for row := range h {
+							for row := range copyH {
 								dstOff := (destY+row)*stage.pitch + destX
 								copy(stage.all[dstOff:dstOff+w], y[row*yStride:row*yStride+w])
 							}
-							for row := range ph {
+							for row := range copyPh {
 								dstOff := yBaseLen + (destY/2+row)*stage.pitch + destX
 								copy(stage.all[dstOff:dstOff+w], uv[row*uvStride:row*uvStride+w])
 							}
@@ -1055,43 +1067,55 @@ func mainLoop(hostPort, domain, user, password string, width, height int, swapAl
 						yBaseLen := stage.pitch * stage.th
 						uPitch := (stage.pitch + 1) / 2
 						phTex := (stage.th + 1) / 2
-						uvLen := uPitch * ph
 						uBaseLen := yBaseLen + uPitch*phTex
 						vBaseLen := uBaseLen + uPitch*phTex
 						fastPath := stage.pitch == yStride && uPitch == uStride && destX == 0 && destY == 0
 						fullTexture := fastPath && h == stage.th
 						isNull := isNullYUVFrame(y, u)
+						// Clip copy height to texture dimensions (same rationale as NV12
+						// path: H.264 frame height rounds up to 16-pixel multiples, so h
+						// may exceed stage.th, causing buffer overflow and, in the parallel
+						// fast path, a data race between Y and UV goroutines).
+						copyH := min(h, stage.th)
+						copyPh := min(ph, phTex)
 						if isNull {
 							// Fill U and V planes with 128 so Unlock commits black
 							// instead of green.  Metal staging buffers may be freshly
 							// zeroed (UV=0); Y=0,UV=0 renders as green in BT.601.
 							fillBytes(stage.all[uBaseLen:], 128)
 						} else if fastPath {
-							yLen := stage.pitch * h
-							total := yLen + uvLen*2
+							yLen := stage.pitch * copyH
+							copyUVLen := uPitch * copyPh
+							total := yLen + copyUVLen*2
 							if total >= 256*256*4 {
 								var wg sync.WaitGroup
 								wg.Add(3)
 								go func() { defer wg.Done(); copy(stage.all[:yLen], y[:yLen]) }()
-								go func() { defer wg.Done(); copy(stage.all[uBaseLen:uBaseLen+uvLen], u[:uvLen]) }()
-								go func() { defer wg.Done(); copy(stage.all[vBaseLen:vBaseLen+uvLen], v[:uvLen]) }()
+								go func() {
+									defer wg.Done()
+									copy(stage.all[uBaseLen:uBaseLen+copyUVLen], u[:copyUVLen])
+								}()
+								go func() {
+									defer wg.Done()
+									copy(stage.all[vBaseLen:vBaseLen+copyUVLen], v[:copyUVLen])
+								}()
 								wg.Wait()
 							} else {
 								copy(stage.all[:yLen], y[:yLen])
-								copy(stage.all[uBaseLen:uBaseLen+uvLen], u[:uvLen])
-								copy(stage.all[vBaseLen:vBaseLen+uvLen], v[:uvLen])
+								copy(stage.all[uBaseLen:uBaseLen+copyUVLen], u[:copyUVLen])
+								copy(stage.all[vBaseLen:vBaseLen+copyUVLen], v[:copyUVLen])
 							}
 						} else {
 							w2 := (w + 1) / 2
-							for row := range h {
+							for row := range copyH {
 								dstOff := (destY+row)*stage.pitch + destX
 								copy(stage.all[dstOff:dstOff+w], y[row*yStride:row*yStride+w])
 							}
-							for row := range ph {
+							for row := range copyPh {
 								dstOff := uBaseLen + (destY/2+row)*uPitch + destX/2
 								copy(stage.all[dstOff:dstOff+w2], u[row*uStride:row*uStride+w2])
 							}
-							for row := range ph {
+							for row := range copyPh {
 								dstOff := vBaseLen + (destY/2+row)*uPitch + destX/2
 								copy(stage.all[dstOff:dstOff+w2], v[row*vStride:row*vStride+w2])
 							}
