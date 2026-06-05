@@ -56,26 +56,18 @@ func fillBytes(s []byte, v byte) {
 // Dirty rects are appended to dirtyRects so the caller can later clear only
 // those regions (instead of the entire texture) when a new H.264 frame arrives.
 //
-// Fast-path (BitsPerPixel==4, native BGRA) bitmaps are batched: when there are
-// multiple patches, the function computes their bounding rect (clamped to the
-// texture dimensions), locks the texture once, copies all rows in Go, then
-// unlocks — reducing SDL/cgo/GPU calls from O(N) to O(1) per render tick.
-// Clamping is critical: RDP can deliver bitmaps with destination coordinates
-// that extend outside the screen (e.g. partially off-screen windows).  Without
-// clamping, SDL clips the lock rect internally but go-sdl2 still computes the
-// slice length from the unclipped dimensions, causing out-of-bounds panics.
-// A single patch keeps the cheaper direct SDL_UpdateTexture path.
-// Slow-path (legacy bit-depth) bitmaps are uncommon and fall back to per-patch
-// Update as before.
+// Slow-path (legacy bit-depth) bitmaps are uncommon; a shared BGRA scratch
+// buffer is reused across those patches to avoid per-patch allocations.
+// Fast-path (BitsPerPixel==4, native BGRA) bitmaps use one SDL_UpdateTexture
+// call per patch.  SDL_LockTexture on macOS/Metal returns a zero-initialised
+// staging buffer rather than existing texture content, so batching patches into
+// a single Lock+Unlock would paint black over any gap; per-patch UpdateTexture
+// avoids this.  Both cases are handled in a single loop over bs.
 func paintImages(bs []grdp.Bitmap, texture *sdl.Texture, width, height int, dirtyRects *[]sdl.Rect) {
-	// First pass: handle slow-path (legacy bpp) bitmaps immediately.
-	// Reuse a single BGRA scratch buffer across patches to avoid repeated
-	// allocations for the common case of many same-sized tiles per frame.
 	var bgraBuf []byte
 	for _, bm := range bs {
 		if bm.BitsPerPixel != 4 {
-			// FillBGRA converts to packed BGRA32 in a single pass, reusing
-			// bgraBuf so no per-patch allocation is needed.
+			// Slow path: convert legacy bit-depth to BGRA32, reusing bgraBuf.
 			bgraBuf = bm.FillBGRA(bgraBuf)
 			if len(bgraBuf) == 0 {
 				continue
@@ -85,20 +77,11 @@ func paintImages(bs []grdp.Bitmap, texture *sdl.Texture, width, height int, dirt
 			rect := sdl.Rect{X: int32(bm.DestLeft), Y: int32(bm.DestTop), W: int32(w), H: int32(h)}
 			texture.Update(&rect, unsafe.Pointer(&bgraBuf[0]), bm.Width*4)
 			*dirtyRects = append(*dirtyRects, rect)
+			continue
 		}
-	}
 
-	// Second pass: fast-path (BitsPerPixel==4) bitmaps — one SDL_UpdateTexture
-	// call per patch.  SDL_UpdateTexture is a read-modify-write operation that
-	// only touches the specified rect, so patches at different screen locations
-	// do not overwrite each other or the surrounding texture content.
-	//
-	// Note: SDL_LockTexture on macOS/Metal returns a zero-initialised staging
-	// buffer rather than the existing texture content, so batching patches into
-	// a single Lock+Unlock would paint black over any gap between patches.
-	// Per-patch SDL_UpdateTexture avoids that problem entirely.
-	for _, bm := range bs {
-		if bm.BitsPerPixel != 4 || len(bm.Data) == 0 {
+		// Fast path: native BGRA — one SDL_UpdateTexture per patch.
+		if len(bm.Data) == 0 {
 			continue
 		}
 		w := min(bm.DestRight-bm.DestLeft+1, bm.Width)
@@ -616,6 +599,22 @@ func mainLoop(hostPort, domain, user, password string, width, height int, swapAl
 	yuvDoneCh := make(chan yuvDone, 1)
 	var yuvWriteWg sync.WaitGroup // counts H.264 writes currently in progress
 
+	// parallelCopyJobCh / parallelCopyDoneCh implement a persistent 2-goroutine
+	// pool for the parallel Y/UV plane copy in the OnH264NV12 fast path.
+	// Using persistent goroutines avoids the per-frame closure heap allocation
+	// and goroutine creation overhead that the old sync.WaitGroup + go func()
+	// approach incurred at every H.264 frame (~120 allocs/s at 60 fps).
+	parallelCopyJobCh := make(chan [2][]byte, 2)
+	parallelCopyDoneCh := make(chan struct{}, 2)
+	for range 2 {
+		go func() {
+			for job := range parallelCopyJobCh {
+				copy(job[0], job[1])
+				parallelCopyDoneCh <- struct{}{}
+			}
+		}()
+	}
+
 	// lastH264DropNs records the Unix nanosecond timestamp of the most recent
 	// dropped H.264 frame (0 = no recent drop).  Used to set the queueDepth
 	// hint that tells the RDP server to reduce H.264 bitrate when SDL's
@@ -963,14 +962,10 @@ func mainLoop(hostPort, domain, user, password string, width, height int, swapAl
 							copyUVLen := stage.pitch * copyPh
 							total := yLen + copyUVLen
 							if total >= 256*256*4 {
-								var wg sync.WaitGroup
-								wg.Add(2)
-								go func() { defer wg.Done(); copy(stage.all[:yLen], y[:yLen]) }()
-								go func() {
-									defer wg.Done()
-									copy(stage.all[yBaseLen:yBaseLen+copyUVLen], uv[:copyUVLen])
-								}()
-								wg.Wait()
+								parallelCopyJobCh <- [2][]byte{stage.all[:yLen], y[:yLen]}
+								parallelCopyJobCh <- [2][]byte{stage.all[yBaseLen : yBaseLen+copyUVLen], uv[:copyUVLen]}
+								<-parallelCopyDoneCh
+								<-parallelCopyDoneCh
 							} else {
 								copy(stage.all[:yLen], y[:yLen])
 								copy(stage.all[yBaseLen:yBaseLen+copyUVLen], uv[:copyUVLen])
