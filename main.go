@@ -599,22 +599,6 @@ func mainLoop(hostPort, domain, user, password string, width, height int, swapAl
 	yuvDoneCh := make(chan yuvDone, 1)
 	var yuvWriteWg sync.WaitGroup // counts H.264 writes currently in progress
 
-	// parallelCopyJobCh / parallelCopyDoneCh implement a persistent 2-goroutine
-	// pool for the parallel Y/UV plane copy in the OnH264NV12 fast path.
-	// Using persistent goroutines avoids the per-frame closure heap allocation
-	// and goroutine creation overhead that the old sync.WaitGroup + go func()
-	// approach incurred at every H.264 frame (~120 allocs/s at 60 fps).
-	parallelCopyJobCh := make(chan [2][]byte, 2)
-	parallelCopyDoneCh := make(chan struct{}, 2)
-	for range 2 {
-		go func() {
-			for job := range parallelCopyJobCh {
-				copy(job[0], job[1])
-				parallelCopyDoneCh <- struct{}{}
-			}
-		}()
-	}
-
 	// lastH264DropNs records the Unix nanosecond timestamp of the most recent
 	// dropped H.264 frame (0 = no recent drop).  Used to set the queueDepth
 	// hint that tells the RDP server to reduce H.264 bitrate when SDL's
@@ -962,10 +946,14 @@ func mainLoop(hostPort, domain, user, password string, width, height int, swapAl
 							copyUVLen := stage.pitch * copyPh
 							total := yLen + copyUVLen
 							if total >= 256*256*4 {
-								parallelCopyJobCh <- [2][]byte{stage.all[:yLen], y[:yLen]}
-								parallelCopyJobCh <- [2][]byte{stage.all[yBaseLen : yBaseLen+copyUVLen], uv[:copyUVLen]}
-								<-parallelCopyDoneCh
-								<-parallelCopyDoneCh
+								var wg sync.WaitGroup
+								wg.Add(2)
+								go func() { defer wg.Done(); copy(stage.all[:yLen], y[:yLen]) }()
+								go func() {
+									defer wg.Done()
+									copy(stage.all[yBaseLen:yBaseLen+copyUVLen], uv[:copyUVLen])
+								}()
+								wg.Wait()
 							} else {
 								copy(stage.all[:yLen], y[:yLen])
 								copy(stage.all[yBaseLen:yBaseLen+copyUVLen], uv[:copyUVLen])
