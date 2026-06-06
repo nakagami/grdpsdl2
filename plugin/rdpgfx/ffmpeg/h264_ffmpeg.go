@@ -1428,7 +1428,9 @@ type ffmpegDecoder struct {
 
 	// outI420Ring holds two recyclable I420 frame slots for GPU-accelerated
 	// rendering via SDL2 IYUV textures.  Same ring/lifecycle pattern as outRing.
-	// outI420Enabled gates I420 extraction (set by DecodeWithI420); lastI420
+	// outI420Enabled gates I420 extraction (set by DecodeWithI420); outNV12Enabled
+	// also triggers I420 extraction for non-NV12 sources (e.g. software YUV420P)
+	// so the caller can use LastI420() to update the AVC444 Y cache.  lastI420
 	// is the result from the most recent convertFrame call.
 	outI420Ring    [2]rdpgfx.H264FrameI420
 	outI420RingIdx int
@@ -1463,6 +1465,13 @@ type ffmpegDecoder struct {
 	// occurring simultaneously at the centre pixel unambiguously signals an
 	// uninitialised buffer rather than real video content.
 	hwNeedsZeroCheck bool
+
+	// swNeedsZeroCheck mirrors hwNeedsZeroCheck for the software (YUV420P)
+	// decode path.  The FFmpeg SW decoder similarly outputs all-zero frames
+	// on the first packet after creation or avcodec_flush_buffers, especially
+	// when primed with a stale cached IDR.  Cleared after the first valid
+	// (non-zero-fill) YUV420P frame is seen.
+	swNeedsZeroCheck bool
 }
 
 // extractI420fromSrc extracts I420 planar data from srcFrame into the ring
@@ -1596,6 +1605,7 @@ func newH264DecoderInternal(watchdogCh chan<- struct{}, forceSW bool, kfWaitTime
 		lastFmt:          C.AV_PIX_FMT_NONE,
 		needsKeyFrame:    true, // always wait for a clean IDR before feeding packets
 		hwNeedsZeroCheck: true, // check first NV12 output for zero-filled IOSurface
+		swNeedsZeroCheck: true, // check first YUV420P output for zero-fill warm-up
 		watchdogCh:       watchdogCh,
 		kfWaitTimeoutVal: kfWaitTimeout,
 	}
@@ -2169,15 +2179,21 @@ func (d *ffmpegDecoder) Decode(h264Data []byte) (*rdpgfx.H264Frame, error) {
 					"err", int(ret))
 				d.markBroken(rdpgfx.H264BrokenReasonNoIDR)
 			}
-		} else if prev {
-			// SW decoder: error-concealment attempt (proceededWithoutKeyframe)
-			// failed — avcodec_send_packet rejected the P-frame.  Without
-			// marking broken the decoder would loop: wait 900 frames → try →
-			// fail → reset → wait 900 frames → ...  Mark broken so the
-			// soft-reset / reconnect chain can escalate instead.
-			slog.Warn("H.264: SW decoder rejected packet after keyframe wait exhaustion, marking broken",
-				"err", int(ret))
-			d.markBroken(rdpgfx.H264BrokenReasonNoIDR)
+		} else {
+			// Re-arm the SW zero-check: libavcodec similarly outputs zero frames
+			// on the first packet after a flush, especially when primed with a
+			// stale cached IDR.
+			d.swNeedsZeroCheck = true
+			if prev {
+				// SW decoder: error-concealment attempt (proceededWithoutKeyframe)
+				// failed — avcodec_send_packet rejected the P-frame.  Without
+				// marking broken the decoder would loop: wait 900 frames → try →
+				// fail → reset → wait 900 frames → ...  Mark broken so the
+				// soft-reset / reconnect chain can escalate instead.
+				slog.Warn("H.264: SW decoder rejected packet after keyframe wait exhaustion, marking broken",
+					"err", int(ret))
+				d.markBroken(rdpgfx.H264BrokenReasonNoIDR)
+			}
 		}
 		return nil, nil
 	}
@@ -2331,6 +2347,16 @@ func (d *ffmpegDecoder) DecodeWithI420(h264Data []byte) (*rdpgfx.H264Frame, *rdp
 	frame, err := d.Decode(h264Data)
 	d.outI420Enabled = false
 	return frame, d.lastI420, err
+}
+
+// LastI420 returns the I420 frame produced during the most recent Decode,
+// DecodeWithI420, or DecodeWithNV12 call.  For DecodeWithNV12, this is
+// non-nil when the source format was YUV420P/YUVJ420P (software decoder)
+// rather than NV12, allowing callers to refresh the AVC444 Y cache even
+// when no native NV12 planes were available.  Must be called from the same
+// goroutine as Decode; the returned pointer is valid until the next call.
+func (d *ffmpegDecoder) LastI420() *rdpgfx.H264FrameI420 {
+	return d.lastI420
 }
 
 // DecodeWithNV12 implements the rdpgfx.NV12Decoder interface.  It decodes H.264 NAL
@@ -2521,11 +2547,16 @@ func (d *ffmpegDecoder) convertFrame(regionHint []C.uint16_t, nRegions C.int) (*
 		if srcFmt == C.AV_PIX_FMT_YUVJ420P || srcFrame.color_range == 2 {
 			fullRange = 1
 		}
+		// Sample the centre pixel for diagnostic logging and SW zero-frame checks.
+		// For SW decoder, always sample: zero-UV is checked on every frame.
+		needSample := d.hwFrameCount < 3 || !d.useHW
+		var sy, su, sv C.uint8_t
+		if needSample {
+			C.grdp_sample_yuv(srcFrame, &sy, &su, &sv)
+		}
 		// Log the centre-pixel YUV values for the first few frames so we
 		// can distinguish H.264 decode corruption from colour-conversion bugs.
 		if d.hwFrameCount < 3 || (!d.useHW && d.swFrameCount < 3) {
-			var sy, su, sv C.uint8_t
-			C.grdp_sample_yuv(srcFrame, &sy, &su, &sv)
 			slog.Debug("H.264: frame sample (yuv420p)",
 				"hw", d.useHW,
 				"frame", d.hwFrameCount,
@@ -2538,6 +2569,35 @@ func (d *ffmpegDecoder) convertFrame(regionHint []C.uint16_t, nRegions C.int) (*
 				d.hwFrameCount++
 			} else {
 				d.swFrameCount++
+			}
+		}
+		// Drop corrupted/uninitialised frames from the SW decoder.
+		//
+		// Zero-UV check (permanent): U=0 and V=0 simultaneously never occurs in
+		// real BT.601/BT.709 content — valid chroma always centres on 128.  This
+		// pattern indicates a reference-frame mismatch (stale-IDR priming with
+		// live P-frames that reference a different state) or an uninitialised
+		// buffer.  BT.601 conversion of (Y=0, U=0, V=0) → BGRA(0,135,0,255)
+		// is a full-screen bright-green frame.  Apply permanently; cost is one
+		// pixel sample per frame which is negligible.
+		//
+		// Warm-up black check (gated by swNeedsZeroCheck): Y=0, U≈128, V≈128
+		// with all luma near zero is libavcodec's initial black output before
+		// the pipeline is ready.  Only checked around decoder creation/flush.
+		if !d.useHW {
+			if su == 0 && sv == 0 {
+				slog.Debug("H.264: dropping zero-UV SW frame (reference mismatch or uninitialised)",
+					"Y", int(sy))
+				return &rdpgfx.H264Frame{Dropped: true, Width: int(w), Height: int(h)}, transferNs, nil
+			}
+			if d.swNeedsZeroCheck {
+				if sy == 0 && su >= 124 && su <= 132 && sv >= 124 && sv <= 132 &&
+					C.grdp_is_warmup_nv12(srcFrame, 4) != 0 {
+					slog.Debug("H.264: dropping black warm-up SW frame",
+						"Y", int(sy), "U", int(su), "V", int(sv))
+					return &rdpgfx.H264Frame{Dropped: true, Width: int(w), Height: int(h)}, transferNs, nil
+				}
+				d.swNeedsZeroCheck = false
 			}
 		}
 		if haveRegions {
@@ -2685,7 +2745,11 @@ func (d *ffmpegDecoder) convertFrame(regionHint []C.uint16_t, nRegions C.int) (*
 			(*C.uint8_t)(unsafe.Pointer(&out[0])), C.int(w*4))
 	}
 
-	if convErr == nil && d.outI420Enabled {
+	// Extract I420 when explicitly requested (DecodeWithI420) or when in NV12
+	// mode but the source is not NV12 (e.g. software decoder producing YUV420P).
+	// The latter lets callers use LastI420() to refresh the AVC444 Y cache even
+	// when DecodeWithNV12 returns a BGRA frame instead of native NV12 planes.
+	if convErr == nil && (d.outI420Enabled || d.outNV12Enabled) {
 		d.extractI420fromSrc(srcFrame)
 	}
 	if usedMapFrame {
