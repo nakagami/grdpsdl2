@@ -531,6 +531,12 @@ func mainLoop(hostPort, domain, user, password string, width, height int, swapAl
 	// offloading colour conversion entirely from the CPU.
 	// On software renderers SDL2 does the conversion in software — no separate
 	// GPU/non-GPU code path is needed.
+	//
+	// Force BT.709 explicitly so SDL2 uses the same colour matrix as the AVC444
+	// LC=2 BGRA combine path for all resolutions.  Without this, SDL2 auto-
+	// selects BT.601 for SD (≤1000×600) sessions and BT.709 for HD sessions,
+	// which would cause a coefficient mismatch for low-resolution RDP targets.
+	sdl.SetYUVConversionMode(sdl.YUV_CONVERSION_BT709)
 	yuvTextureFormat := uint32(sdl.PIXELFORMAT_IYUV)
 	if runtime.GOOS == "darwin" {
 		yuvTextureFormat = sdlPixelFormatNV12
