@@ -636,18 +636,38 @@ func mainLoop(hostPort, domain, user, password string, width, height int, swapAl
 	// recreating it.  Waits for any in-progress callback write to finish,
 	// then unlocks if the texture is currently held by the pre-lock path.
 	// Must be called from the main goroutine.
+	//
+	// Order matters: drain yuvStageCh FIRST so that any new callbacks
+	// arriving after the drain find the channel empty and take the default
+	// (drop) branch — they never receive a stage and therefore never spawn
+	// write goroutines.  Only after the channel is empty do we call Wait()
+	// to join any goroutines that were already mid-write.  Calling Wait()
+	// first and draining second leaves a window where a callback calls
+	// Add(1) after Wait() returns (counter was 0), then receives the
+	// stage before we drain it, spawns goroutines, and those goroutines
+	// race with the imminent texture destroy.
 	drainPreLock := func() {
-		yuvWriteWg.Wait() // wait for any concurrent callback write to finish
+		// Remove the pre-locked stage so no new callback can start a write.
 		select {
 		case <-yuvStageCh:
-			yuvTexture.Unlock() // stage was pre-locked but callback never consumed it
+			// Stage was sitting in the channel (callback never consumed it).
+			// Unlock is deferred to after Wait() so the sequence is:
+			// drain → wait → unlock, preventing a double-unlock if a
+			// callback is already mid-write with this stage.
+			defer yuvTexture.Unlock()
 		default:
-			select {
-			case <-yuvDoneCh:
-				yuvTexture.Unlock() // callback wrote a frame; its Unlock was deferred to us
-			default:
-				// texture is not currently locked; nothing to do
-			}
+		}
+		// Wait for any callback that already received the stage (and called
+		// Add) to finish writing and call Done.
+		yuvWriteWg.Wait()
+		// If a callback consumed the stage and sent a done notification,
+		// the main loop (now exiting or reconnecting) hasn't consumed it yet
+		// — do the deferred Unlock here.
+		select {
+		case <-yuvDoneCh:
+			yuvTexture.Unlock() // callback wrote a frame; its Unlock was deferred to us
+		default:
+			// texture is not currently locked; nothing to do
 		}
 	}
 
@@ -1513,6 +1533,15 @@ func mainLoop(hostPort, domain, user, password string, width, height int, swapAl
 		if ap.reopenNeeded.CompareAndSwap(true, false) {
 			ap.reopen()
 		}
+	}
+
+	// Drain the pre-lock before the deferred cleanup (renderer.Destroy,
+	// yuvTexture.Destroy) frees the Metal staging buffer.  Without this,
+	// NV12 write goroutines spawned by the last callback invocation can
+	// still be running when renderer.Destroy() invalidates stage.all,
+	// causing a SIGSEGV (KERN_PROTECTION_FAILURE) in memmove.
+	if yuvTexture != nil && yuvPrimaryPath {
+		drainPreLock()
 	}
 
 	err = window.Destroy()
