@@ -3,7 +3,7 @@ module github.com/nakagami/grdpsdl2
 go 1.26.3
 
 require (
-	github.com/nakagami/grdp v0.8.5
+	github.com/nakagami/grdp v0.8.7
 	github.com/veandco/go-sdl2 v0.4.40
 )
 
@@ -13,4 +13,3 @@ require (
 )
 
 // replace github.com/nakagami/grdp => /Users/nakagami/grdp
-replace github.com/nakagami/grdp => /Users/nakagami/grdp
