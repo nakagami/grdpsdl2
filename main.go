@@ -425,7 +425,7 @@ func isNullYUVFrame(y, chroma []byte) bool {
 	return true
 }
 
-func mainLoop(hostPort, domain, user, password string, width, height int, swapAltMeta bool, keyboardType, keyboardLayout string) (err error) {
+func mainLoop(hostPort, domain, user, password string, width, height int, swapAltMeta bool, keyboardType, keyboardLayout string, disableAVC444 bool) (err error) {
 	cursorCache := make(map[uint16]*sdl.Cursor)
 	showCursor := true
 
@@ -786,6 +786,9 @@ func mainLoop(hostPort, domain, user, password string, width, height int, swapAl
 	}
 	if keyboardLayout != "" {
 		rdpClient.SetKeyboardLayout(keyboardLayout)
+	}
+	if disableAVC444 {
+		rdpClient.DisableAVC444()
 	}
 	rdpClient.OnClipboard(
 		func(text string) {
@@ -1693,13 +1696,14 @@ func main() {
 
 	swapAltMeta := flag.Bool("swap-alt-meta", false, "swap alt and meta key")
 	debugLog := flag.Bool("debug", false, "enable debug logging")
+	disableAVC444 := flag.Bool("disable-avc444", false, "disable AVC444/AVC444v2 and use AVC420 only")
 	flag.Parse()
 
 	if *debugLog {
 		handler := slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelDebug})
 		slog.SetDefault(slog.New(handler))
 	}
-	slog.Debug("flag", "swap_alt_meta", *swapAltMeta, "debug", *debugLog)
+	slog.Debug("flag", "swap_alt_meta", *swapAltMeta, "debug", *debugLog, "disable_avc444", *disableAVC444)
 
 	hostPort := strings.Join([]string{os.Getenv("GRDP_HOST"), os.Getenv("GRDP_PORT")}, ":")
 	domain := os.Getenv("GRDP_DOMAIN")
@@ -1713,5 +1717,5 @@ func main() {
 		width, height = 1280, 800
 	}
 
-	mainLoop(hostPort, domain, user, password, width, height, *swapAltMeta, keyboardType, keyboardLayout)
+	mainLoop(hostPort, domain, user, password, width, height, *swapAltMeta, keyboardType, keyboardLayout, *disableAVC444)
 }
