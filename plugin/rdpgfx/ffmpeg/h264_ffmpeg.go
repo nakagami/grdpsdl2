@@ -2582,6 +2582,13 @@ func (d *ffmpegDecoder) convertFrame(regionHint []C.uint16_t, nRegions C.int) (*
 		// is a full-screen bright-green frame.  Apply permanently; cost is one
 		// pixel sample per frame which is negligible.
 		//
+		// Near-zero UV check: stale-IDR priming sometimes produces chroma that
+		// is not exactly 0/0 but still extremely low (e.g. U=1, V=3).  Valid
+		// content, even dark scenes, keeps chroma centred near 128; both planes
+		// falling well below the neutral midpoint with dark luma is a reliable
+		// sign of decoder corruption.  Catching these frames lets the SW fallback
+		// drop-counter escalate to reconnect before the green frames persist.
+		//
 		// Warm-up black check (gated by swNeedsZeroCheck): Y=0, U≈128, V≈128
 		// with all luma near zero is libavcodec's initial black output before
 		// the pipeline is ready.  Only checked around decoder creation/flush.
@@ -2589,6 +2596,11 @@ func (d *ffmpegDecoder) convertFrame(regionHint []C.uint16_t, nRegions C.int) (*
 			if su == 0 && sv == 0 {
 				slog.Debug("H.264: dropping zero-UV SW frame (reference mismatch or uninitialised)",
 					"Y", int(sy))
+				return &rdpgfx.H264Frame{Dropped: true, Width: int(w), Height: int(h)}, transferNs, nil
+			}
+			if su < 8 && sv < 8 && sy < 32 {
+				slog.Debug("H.264: dropping near-zero-UV SW frame (stale IDR prime?)",
+					"Y", int(sy), "U", int(su), "V", int(sv))
 				return &rdpgfx.H264Frame{Dropped: true, Width: int(w), Height: int(h)}, transferNs, nil
 			}
 			if d.swNeedsZeroCheck {
