@@ -2585,9 +2585,20 @@ func (d *ffmpegDecoder) convertFrame(regionHint []C.uint16_t, nRegions C.int) (*
 		// Near-zero UV check: stale-IDR priming sometimes produces chroma that
 		// is not exactly 0/0 but still extremely low (e.g. U=1, V=3).  Valid
 		// content, even dark scenes, keeps chroma centred near 128; both planes
-		// falling well below the neutral midpoint with dark luma is a reliable
-		// sign of decoder corruption.  Catching these frames lets the SW fallback
-		// drop-counter escalate to reconnect before the green frames persist.
+		// falling well below the neutral midpoint is a reliable sign of decoder
+		// corruption.  Catching these frames lets the SW fallback drop-counter
+		// escalate to reconnect before the green frames persist.
+		//
+		// Two thresholds are applied:
+		//   * Very-low chroma (U<4 && V<4): dropped regardless of luma.  Both
+		//     planes collapsing to ~0 never occurs in real BT.601/BT.709 content
+		//     at any brightness — it always renders as a full-screen green frame
+		//     (BT.709 of Cb≈0,Cr≈0 → BGRA(0, Y+84, 0)).  The earlier gate that
+		//     also required dark luma (Y<32) let moderate-luma corrupt frames
+		//     (e.g. Y=75, U=0, V=2) slip through and paint the screen green
+		//     during a VideoToolbox stall + SW fallback.
+		//   * Low chroma with dark luma (U<8 && V<8 && Y<32): a looser catch for
+		//     slightly higher (but still abnormal) chroma in dark scenes.
 		//
 		// Warm-up black check (gated by swNeedsZeroCheck): Y=0, U≈128, V≈128
 		// with all luma near zero is libavcodec's initial black output before
@@ -2598,7 +2609,7 @@ func (d *ffmpegDecoder) convertFrame(regionHint []C.uint16_t, nRegions C.int) (*
 					"Y", int(sy))
 				return &rdpgfx.H264Frame{Dropped: true, Width: int(w), Height: int(h)}, transferNs, nil
 			}
-			if su < 8 && sv < 8 && sy < 32 {
+			if (su < 4 && sv < 4) || (su < 8 && sv < 8 && sy < 32) {
 				slog.Debug("H.264: dropping near-zero-UV SW frame (stale IDR prime?)",
 					"Y", int(sy), "U", int(su), "V", int(sv))
 				return &rdpgfx.H264Frame{Dropped: true, Width: int(w), Height: int(h)}, transferNs, nil
