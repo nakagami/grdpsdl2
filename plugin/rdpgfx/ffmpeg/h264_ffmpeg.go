@@ -154,25 +154,25 @@ static int grdp_is_full_range_fmt(enum AVPixelFormat fmt) {
             fmt == AV_PIX_FMT_YUVJ440P) ? 1 : 0;
 }
 
-// grdp_bt601_pixel writes one BGRA pixel using BT.601 coefficients.
+// grdp_bt709_pixel writes one BGRA pixel using BT.709 coefficients.
 // u and v are pre-offset (i.e. raw_value - 128).
 // full_range: 0 = limited (video) range [16-235 / 16-240],
 //             1 = full range [0-255].
 #define CLAMP8(x) ((x) < 0 ? 0 : (x) > 255 ? 255 : (uint8_t)(x))
-static inline void grdp_bt601_pixel(
+static inline void grdp_bt709_pixel(
     int y_raw, int u, int v, int full_range, uint8_t *dst)
 {
     int r, g, b;
     if (full_range) {
         int y = y_raw;
-        r = (256*y + 359*v           + 128) >> 8;
-        g = (256*y -  88*u - 183*v   + 128) >> 8;
-        b = (256*y + 454*u           + 128) >> 8;
+        r = (256*y + 403*v           + 128) >> 8;
+        g = (256*y -  48*u - 120*v   + 128) >> 8;
+        b = (256*y + 475*u           + 128) >> 8;
     } else {
         int c = y_raw - 16;
-        r = (298*c + 409*v           + 128) >> 8;
-        g = (298*c - 100*u - 208*v   + 128) >> 8;
-        b = (298*c + 516*u           + 128) >> 8;
+        r = (298*c + 459*v           + 128) >> 8;
+        g = (298*c -  55*u - 136*v   + 128) >> 8;
+        b = (298*c + 541*u           + 128) >> 8;
     }
     dst[0] = CLAMP8(b);
     dst[1] = CLAMP8(g);
@@ -181,7 +181,7 @@ static inline void grdp_bt601_pixel(
 }
 
 // grdp_yuv420p_to_bgra converts a planar YUV420P/YUVJ420P frame to packed
-// BGRA using BT.601 coefficients.  This bypasses swscale entirely so that
+// BGRA using BT.709 coefficients.  This bypasses swscale entirely so that
 // the broken ARM64 colorspace-matrix fallback path is never taken.
 #ifdef __ARM_NEON__
 // grdp_yuv420p_to_bgra_neon_8 processes 8 luma pixels (4 UV pairs) per call.
@@ -303,14 +303,14 @@ static inline void grdp_yuv420p_to_bgra_neon_16(
 // ----------------------------------------------------------------------------
 // SSE2 YUV→BGRA inline helpers (x86_64)
 // Each function converts 8 luma pixels per call using 128-bit SIMD.
-// Coefficients and arithmetic match the NEON paths above (BT.601, fixed-point
+// Coefficients and arithmetic match the NEON paths above (BT.709, fixed-point
 // with 8 fractional bits): R = (ky*Y + kr*V + 128) >> 8, etc.
-// _mm_madd_epi16 is used for the R and B channels because kb=516 overflows
-// int16 multiplication (516×127 = 65532 > 32767); madd widens to int32.
+// _mm_madd_epi16 is used for the R and B channels because kb=541 overflows
+// int16 multiplication (541×127 = 68707 > 32767); madd widens to int32.
 // ----------------------------------------------------------------------------
 #ifdef __SSE2__
 
-// Shared BT.601 arithmetic core.  Receives pre-biased int16 vectors
+// Shared BT.709 arithmetic core.  Receives pre-biased int16 vectors
 // y16 (Y − yoff), u16 (U − 128), v16 (V − 128) and stores 8 BGRA pixels.
 static inline void grdp_yuv_to_bgra_sse2_core(
     __m128i y16, __m128i u16, __m128i v16,
@@ -421,10 +421,10 @@ static void grdp_yuv420p_to_bgra(
     int height = src->height;
 #ifdef __ARM_NEON__
     int16_t ky   = full_range ? 256 : 298;
-    int16_t kr   = full_range ? 359 : 409;
-    int16_t kgu  = full_range ?  88 : 100;
-    int16_t kgv  = full_range ? 183 : 208;
-    int16_t kb   = full_range ? 454 : 516;
+    int16_t kr   = full_range ? 403 : 459;
+    int16_t kgu  = full_range ?  48 :  55;
+    int16_t kgv  = full_range ? 120 : 136;
+    int16_t kb   = full_range ? 475 : 541;
     int16_t yoff = full_range ?   0 :  16;
     for (int row = 0; row < height; row++) {
         const uint8_t *yrow = src->data[0] + row        * src->linesize[0];
@@ -442,15 +442,15 @@ static void grdp_yuv420p_to_bgra(
         for (; col < width; col++) {
             int u = (int)urow[col >> 1] - 128;
             int v = (int)vrow[col >> 1] - 128;
-            grdp_bt601_pixel((int)yrow[col], u, v, full_range, drow + col*4);
+            grdp_bt709_pixel((int)yrow[col], u, v, full_range, drow + col*4);
         }
     }
 #elif defined(__SSE2__)
     int16_t ky   = full_range ? 256 : 298;
-    int16_t kr   = full_range ? 359 : 409;
-    int16_t kgu  = full_range ?  88 : 100;
-    int16_t kgv  = full_range ? 183 : 208;
-    int16_t kb   = full_range ? 454 : 516;
+    int16_t kr   = full_range ? 403 : 459;
+    int16_t kgu  = full_range ?  48 :  55;
+    int16_t kgv  = full_range ? 120 : 136;
+    int16_t kb   = full_range ? 475 : 541;
     int16_t yoff = full_range ?   0 :  16;
     for (int row = 0; row < height; row++) {
         const uint8_t *yrow = src->data[0] + row        * src->linesize[0];
@@ -464,7 +464,7 @@ static void grdp_yuv420p_to_bgra(
         for (; col < width; col++) {
             int u = (int)urow[col >> 1] - 128;
             int v = (int)vrow[col >> 1] - 128;
-            grdp_bt601_pixel((int)yrow[col], u, v, full_range, drow + col*4);
+            grdp_bt709_pixel((int)yrow[col], u, v, full_range, drow + col*4);
         }
     }
 #else
@@ -476,7 +476,7 @@ static void grdp_yuv420p_to_bgra(
         for (int col = 0; col < width; col++) {
             int u = (int)urow[col >> 1] - 128;
             int v = (int)vrow[col >> 1] - 128;
-            grdp_bt601_pixel((int)yrow[col], u, v, full_range, drow + col*4);
+            grdp_bt709_pixel((int)yrow[col], u, v, full_range, drow + col*4);
         }
     }
 #endif
@@ -495,17 +495,17 @@ static void grdp_yuv420p_to_bgra_regions(
     int height = src->height;
 #ifdef __ARM_NEON__
     int16_t ky   = full_range ? 256 : 298;
-    int16_t kr   = full_range ? 359 : 409;
-    int16_t kgu  = full_range ?  88 : 100;
-    int16_t kgv  = full_range ? 183 : 208;
-    int16_t kb   = full_range ? 454 : 516;
+    int16_t kr   = full_range ? 403 : 459;
+    int16_t kgu  = full_range ?  48 :  55;
+    int16_t kgv  = full_range ? 120 : 136;
+    int16_t kb   = full_range ? 475 : 541;
     int16_t yoff = full_range ?   0 :  16;
 #elif defined(__SSE2__)
     int16_t ky   = full_range ? 256 : 298;
-    int16_t kr   = full_range ? 359 : 409;
-    int16_t kgu  = full_range ?  88 : 100;
-    int16_t kgv  = full_range ? 183 : 208;
-    int16_t kb   = full_range ? 454 : 516;
+    int16_t kr   = full_range ? 403 : 459;
+    int16_t kgu  = full_range ?  48 :  55;
+    int16_t kgv  = full_range ? 120 : 136;
+    int16_t kb   = full_range ? 475 : 541;
     int16_t yoff = full_range ?   0 :  16;
 #endif
     for (int i = 0; i < n_rects; i++) {
@@ -533,7 +533,7 @@ static void grdp_yuv420p_to_bgra_regions(
             for (; col < neon_start && col < right; col++) {
                 int u = (int)urow[col >> 1] - 128;
                 int v = (int)vrow[col >> 1] - 128;
-                grdp_bt601_pixel((int)yrow[col], u, v, full_range, drow + col*4);
+                grdp_bt709_pixel((int)yrow[col], u, v, full_range, drow + col*4);
             }
             for (; col + 15 < right; col += 16)
                 grdp_yuv420p_to_bgra_neon_16(yrow, urow, vrow, drow, col,
@@ -547,7 +547,7 @@ static void grdp_yuv420p_to_bgra_regions(
             for (; col < sse_start && col < right; col++) {
                 int u = (int)urow[col >> 1] - 128;
                 int v = (int)vrow[col >> 1] - 128;
-                grdp_bt601_pixel((int)yrow[col], u, v, full_range, drow + col*4);
+                grdp_bt709_pixel((int)yrow[col], u, v, full_range, drow + col*4);
             }
             for (; col + 7 < right; col += 8)
                 grdp_yuv420p_to_bgra_sse2_8(yrow, urow, vrow, drow, col,
@@ -556,14 +556,14 @@ static void grdp_yuv420p_to_bgra_regions(
             for (; col < right; col++) {
                 int u = (int)urow[col >> 1] - 128;
                 int v = (int)vrow[col >> 1] - 128;
-                grdp_bt601_pixel((int)yrow[col], u, v, full_range, drow + col*4);
+                grdp_bt709_pixel((int)yrow[col], u, v, full_range, drow + col*4);
             }
         }
     }
 }
 
 // grdp_nv12_to_bgra converts a semi-planar NV12 frame (Y plane + interleaved
-// UV plane) to packed BGRA using BT.601 coefficients.  This bypasses swscale
+// UV plane) to packed BGRA using BT.709 coefficients.  This bypasses swscale
 // for the same reason as grdp_yuv420p_to_bgra: on ARM64 swscale's
 // non-accelerated NV12→BGRA fallback ignores sws_setColorspaceDetails.
 // VideoToolbox (macOS HW decoder) always outputs NV12.
@@ -691,10 +691,10 @@ static void grdp_nv12_to_bgra(
 #ifdef __ARM_NEON__
     // NEON fast path: 8 pixels per inner iteration on ARM64.
     int16_t ky  = full_range ? 256 : 298;
-    int16_t kr  = full_range ? 359 : 409;
-    int16_t kgu = full_range ?  88 : 100;
-    int16_t kgv = full_range ? 183 : 208;
-    int16_t kb  = full_range ? 454 : 516;
+    int16_t kr  = full_range ? 403 : 459;
+    int16_t kgu = full_range ?  48 :  55;
+    int16_t kgv = full_range ? 120 : 136;
+    int16_t kb  = full_range ? 475 : 541;
     int16_t yoff = full_range ? 0 : 16;
     for (int row = 0; row < height; row++) {
         const uint8_t *yrow  = src->data[0] + row        * src->linesize[0];
@@ -709,15 +709,15 @@ static void grdp_nv12_to_bgra(
         for (; col < width; col++) {
             int u = (int)uvrow[(col >> 1) * 2    ] - 128;
             int v = (int)uvrow[(col >> 1) * 2 + 1] - 128;
-            grdp_bt601_pixel((int)yrow[col], u, v, full_range, drow + col*4);
+            grdp_bt709_pixel((int)yrow[col], u, v, full_range, drow + col*4);
         }
     }
 #elif defined(__SSE2__)
     int16_t ky  = full_range ? 256 : 298;
-    int16_t kr  = full_range ? 359 : 409;
-    int16_t kgu = full_range ?  88 : 100;
-    int16_t kgv = full_range ? 183 : 208;
-    int16_t kb  = full_range ? 454 : 516;
+    int16_t kr  = full_range ? 403 : 459;
+    int16_t kgu = full_range ?  48 :  55;
+    int16_t kgv = full_range ? 120 : 136;
+    int16_t kb  = full_range ? 475 : 541;
     int16_t yoff = full_range ? 0 : 16;
     for (int row = 0; row < height; row++) {
         const uint8_t *yrow  = src->data[0] + row        * src->linesize[0];
@@ -729,7 +729,7 @@ static void grdp_nv12_to_bgra(
         for (; col < width; col++) {
             int u = (int)uvrow[(col >> 1) * 2    ] - 128;
             int v = (int)uvrow[(col >> 1) * 2 + 1] - 128;
-            grdp_bt601_pixel((int)yrow[col], u, v, full_range, drow + col*4);
+            grdp_bt709_pixel((int)yrow[col], u, v, full_range, drow + col*4);
         }
     }
 #else
@@ -740,7 +740,7 @@ static void grdp_nv12_to_bgra(
         for (int col = 0; col < width; col++) {
             int u = (int)uvrow[(col >> 1) * 2    ] - 128;
             int v = (int)uvrow[(col >> 1) * 2 + 1] - 128;
-            grdp_bt601_pixel((int)yrow[col], u, v, full_range, drow + col*4);
+            grdp_bt709_pixel((int)yrow[col], u, v, full_range, drow + col*4);
         }
     }
 #endif
@@ -757,17 +757,17 @@ static void grdp_nv12_to_bgra_regions(
     int height = src->height;
 #ifdef __ARM_NEON__
     int16_t ky   = full_range ? 256 : 298;
-    int16_t kr   = full_range ? 359 : 409;
-    int16_t kgu  = full_range ?  88 : 100;
-    int16_t kgv  = full_range ? 183 : 208;
-    int16_t kb   = full_range ? 454 : 516;
+    int16_t kr   = full_range ? 403 : 459;
+    int16_t kgu  = full_range ?  48 :  55;
+    int16_t kgv  = full_range ? 120 : 136;
+    int16_t kb   = full_range ? 475 : 541;
     int16_t yoff = full_range ?   0 :  16;
 #elif defined(__SSE2__)
     int16_t ky   = full_range ? 256 : 298;
-    int16_t kr   = full_range ? 359 : 409;
-    int16_t kgu  = full_range ?  88 : 100;
-    int16_t kgv  = full_range ? 183 : 208;
-    int16_t kb   = full_range ? 454 : 516;
+    int16_t kr   = full_range ? 403 : 459;
+    int16_t kgu  = full_range ?  48 :  55;
+    int16_t kgv  = full_range ? 120 : 136;
+    int16_t kb   = full_range ? 475 : 541;
     int16_t yoff = full_range ?   0 :  16;
 #endif
     for (int i = 0; i < n_rects; i++) {
@@ -790,7 +790,7 @@ static void grdp_nv12_to_bgra_regions(
             for (; col < neon_start && col < right; col++) {
                 int u = (int)uvrow[(col >> 1) * 2    ] - 128;
                 int v = (int)uvrow[(col >> 1) * 2 + 1] - 128;
-                grdp_bt601_pixel((int)yrow[col], u, v, full_range, drow + col*4);
+                grdp_bt709_pixel((int)yrow[col], u, v, full_range, drow + col*4);
             }
             for (; col + 15 < right; col += 16)
                 grdp_nv12_to_bgra_neon_16(yrow, uvrow, drow, col, ky, kr, kgu, kgv, kb, yoff);
@@ -801,7 +801,7 @@ static void grdp_nv12_to_bgra_regions(
             for (; col < sse_start && col < right; col++) {
                 int u = (int)uvrow[(col >> 1) * 2    ] - 128;
                 int v = (int)uvrow[(col >> 1) * 2 + 1] - 128;
-                grdp_bt601_pixel((int)yrow[col], u, v, full_range, drow + col*4);
+                grdp_bt709_pixel((int)yrow[col], u, v, full_range, drow + col*4);
             }
             for (; col + 7 < right; col += 8)
                 grdp_nv12_to_bgra_sse2_8(yrow, uvrow, drow, col, ky, kr, kgu, kgv, kb, yoff);
@@ -809,7 +809,7 @@ static void grdp_nv12_to_bgra_regions(
             for (; col < right; col++) {
                 int u = (int)uvrow[(col >> 1) * 2    ] - 128;
                 int v = (int)uvrow[(col >> 1) * 2 + 1] - 128;
-                grdp_bt601_pixel((int)yrow[col], u, v, full_range, drow + col*4);
+                grdp_bt709_pixel((int)yrow[col], u, v, full_range, drow + col*4);
             }
         }
     }
@@ -1004,10 +1004,10 @@ static void grdp_nv12_to_bgra_rows(
     if (end_row > src->height) end_row = src->height;
 #ifdef __ARM_NEON__
     int16_t ky  = full_range ? 256 : 298;
-    int16_t kr  = full_range ? 359 : 409;
-    int16_t kgu = full_range ?  88 : 100;
-    int16_t kgv = full_range ? 183 : 208;
-    int16_t kb  = full_range ? 454 : 516;
+    int16_t kr  = full_range ? 403 : 459;
+    int16_t kgu = full_range ?  48 :  55;
+    int16_t kgv = full_range ? 120 : 136;
+    int16_t kb  = full_range ? 475 : 541;
     int16_t yoff = full_range ? 0 : 16;
     for (int row = start_row; row < end_row; row++) {
         const uint8_t *yrow  = src->data[0] + row        * src->linesize[0];
@@ -1021,15 +1021,15 @@ static void grdp_nv12_to_bgra_rows(
         for (; col < width; col++) {
             int u = (int)uvrow[(col >> 1) * 2    ] - 128;
             int v = (int)uvrow[(col >> 1) * 2 + 1] - 128;
-            grdp_bt601_pixel((int)yrow[col], u, v, full_range, drow + col*4);
+            grdp_bt709_pixel((int)yrow[col], u, v, full_range, drow + col*4);
         }
     }
 #elif defined(__SSE2__)
     int16_t ky  = full_range ? 256 : 298;
-    int16_t kr  = full_range ? 359 : 409;
-    int16_t kgu = full_range ?  88 : 100;
-    int16_t kgv = full_range ? 183 : 208;
-    int16_t kb  = full_range ? 454 : 516;
+    int16_t kr  = full_range ? 403 : 459;
+    int16_t kgu = full_range ?  48 :  55;
+    int16_t kgv = full_range ? 120 : 136;
+    int16_t kb  = full_range ? 475 : 541;
     int16_t yoff = full_range ? 0 : 16;
     for (int row = start_row; row < end_row; row++) {
         const uint8_t *yrow  = src->data[0] + row        * src->linesize[0];
@@ -1041,7 +1041,7 @@ static void grdp_nv12_to_bgra_rows(
         for (; col < width; col++) {
             int u = (int)uvrow[(col >> 1) * 2    ] - 128;
             int v = (int)uvrow[(col >> 1) * 2 + 1] - 128;
-            grdp_bt601_pixel((int)yrow[col], u, v, full_range, drow + col*4);
+            grdp_bt709_pixel((int)yrow[col], u, v, full_range, drow + col*4);
         }
     }
 #else
@@ -1052,7 +1052,7 @@ static void grdp_nv12_to_bgra_rows(
         for (int col = 0; col < width; col++) {
             int u = (int)uvrow[(col >> 1) * 2    ] - 128;
             int v = (int)uvrow[(col >> 1) * 2 + 1] - 128;
-            grdp_bt601_pixel((int)yrow[col], u, v, full_range, drow + col*4);
+            grdp_bt709_pixel((int)yrow[col], u, v, full_range, drow + col*4);
         }
     }
 #endif
@@ -1068,10 +1068,10 @@ static void grdp_yuv420p_to_bgra_rows(
     if (end_row > src->height) end_row = src->height;
 #ifdef __ARM_NEON__
     int16_t ky   = full_range ? 256 : 298;
-    int16_t kr   = full_range ? 359 : 409;
-    int16_t kgu  = full_range ?  88 : 100;
-    int16_t kgv  = full_range ? 183 : 208;
-    int16_t kb   = full_range ? 454 : 516;
+    int16_t kr   = full_range ? 403 : 459;
+    int16_t kgu  = full_range ?  48 :  55;
+    int16_t kgv  = full_range ? 120 : 136;
+    int16_t kb   = full_range ? 475 : 541;
     int16_t yoff = full_range ?   0 :  16;
     for (int row = start_row; row < end_row; row++) {
         const uint8_t *yrow = src->data[0] + row        * src->linesize[0];
@@ -1088,15 +1088,15 @@ static void grdp_yuv420p_to_bgra_rows(
         for (; col < width; col++) {
             int u = (int)urow[col >> 1] - 128;
             int v = (int)vrow[col >> 1] - 128;
-            grdp_bt601_pixel((int)yrow[col], u, v, full_range, drow + col*4);
+            grdp_bt709_pixel((int)yrow[col], u, v, full_range, drow + col*4);
         }
     }
 #elif defined(__SSE2__)
     int16_t ky   = full_range ? 256 : 298;
-    int16_t kr   = full_range ? 359 : 409;
-    int16_t kgu  = full_range ?  88 : 100;
-    int16_t kgv  = full_range ? 183 : 208;
-    int16_t kb   = full_range ? 454 : 516;
+    int16_t kr   = full_range ? 403 : 459;
+    int16_t kgu  = full_range ?  48 :  55;
+    int16_t kgv  = full_range ? 120 : 136;
+    int16_t kb   = full_range ? 475 : 541;
     int16_t yoff = full_range ?   0 :  16;
     for (int row = start_row; row < end_row; row++) {
         const uint8_t *yrow = src->data[0] + row        * src->linesize[0];
@@ -1110,7 +1110,7 @@ static void grdp_yuv420p_to_bgra_rows(
         for (; col < width; col++) {
             int u = (int)urow[col >> 1] - 128;
             int v = (int)vrow[col >> 1] - 128;
-            grdp_bt601_pixel((int)yrow[col], u, v, full_range, drow + col*4);
+            grdp_bt709_pixel((int)yrow[col], u, v, full_range, drow + col*4);
         }
     }
 #else
@@ -1122,7 +1122,7 @@ static void grdp_yuv420p_to_bgra_rows(
         for (int col = 0; col < width; col++) {
             int u = (int)urow[col >> 1] - 128;
             int v = (int)vrow[col >> 1] - 128;
-            grdp_bt601_pixel((int)yrow[col], u, v, full_range, drow + col*4);
+            grdp_bt709_pixel((int)yrow[col], u, v, full_range, drow + col*4);
         }
     }
 #endif
@@ -1151,7 +1151,7 @@ import (
 // useSwscale controls whether YUV420P/YUVJ420P and NV12 frames are converted
 // to BGRA via swscale (SIMD-accelerated on x86_64) or via hand-written C loops.
 // On ARM64, swscale's non-accelerated paths ignore sws_setColorspaceDetails,
-// producing a strong green cast; the hand-written BT.601 loops are used instead.
+// producing a strong green cast; the hand-written BT.709 loops are used instead.
 // On x86_64, swscale is both correct and significantly faster (SSSE3/AVX2).
 var useSwscale = runtime.GOARCH != "arm64"
 
@@ -1458,8 +1458,8 @@ type ffmpegDecoder struct {
 	// NV12 output frame for a zero-filled chroma plane (U=0, V=0).
 	//
 	// VideoToolbox sometimes returns a zero-initialised IOSurface for the
-	// first decoded frame after init or a pipeline flush.  The BT.601
-	// limited-range conversion of (Y=0, U=0, V=0) produces BGRA(0,135,0,255)
+	// first decoded frame after init or a pipeline flush.  The BT.709
+	// limited-range conversion of (Y=0, U=0, V=0) produces BGRA(0,77,0,255)
 	// — a full-screen dark-green frame that manifests as a brief "green
 	// curtain" in the UI.  Valid NV12 chroma always centres on 128
 	// (limited-range [16,240], full-range centred on 128), so U=0 and V=0
@@ -2523,7 +2523,7 @@ func (d *ffmpegDecoder) convertFrame(regionHint []C.uint16_t, nRegions C.int) (*
 	d.outRingIdx ^= 1
 
 	// For planar YUV420P (both limited- and full-range variants), use our own
-	// BT.601 conversion instead of swscale on ARM64.  swscale has no
+	// BT.709 conversion instead of swscale on ARM64.  swscale has no
 	// accelerated colorspace-conversion path for yuv420p→bgra on ARM64 and
 	// its non-accelerated fallback ignores sws_setColorspaceDetails,
 	// producing a strong green cast.  On x86_64 swscale is both correct and
@@ -2538,7 +2538,7 @@ func (d *ffmpegDecoder) convertFrame(regionHint []C.uint16_t, nRegions C.int) (*
 	// hand-written region-aware functions even on x86_64.  swscale has no
 	// partial-frame API, so it would convert the full frame unconditionally.
 	// For typical RDP partial-screen updates (cursors, small windows) the
-	// scalar BT.601 loop over only the dirty pixels is significantly faster
+	// scalar BT.709 loop over only the dirty pixels is significantly faster
 	// than running swscale over the entire frame.
 	haveRegions := nRegions > 0 && len(regionHint) > 0
 	var convErr error
@@ -2578,7 +2578,7 @@ func (d *ffmpegDecoder) convertFrame(regionHint []C.uint16_t, nRegions C.int) (*
 		// real BT.601/BT.709 content — valid chroma always centres on 128.  This
 		// pattern indicates a reference-frame mismatch (stale-IDR priming with
 		// live P-frames that reference a different state) or an uninitialised
-		// buffer.  BT.601 conversion of (Y=0, U=0, V=0) → BGRA(0,135,0,255)
+		// buffer.  BT.709 conversion of (Y=0, U=0, V=0) → BGRA(0,77,0,255)
 		// is a full-screen bright-green frame.  Apply permanently; cost is one
 		// pixel sample per frame which is negligible.
 		//
@@ -2637,8 +2637,8 @@ func (d *ffmpegDecoder) convertFrame(regionHint []C.uint16_t, nRegions C.int) (*
 		}
 		// Zero-filled IOSurface detection: VideoToolbox sometimes returns an
 		// uninitialised (all-zero) IOSurface on the first decoded frame after
-		// decoder init or avcodec_flush_buffers.  BT.601 limited-range
-		// conversion of (Y=0, U=0, V=0) yields BGRA(0,135,0,255), a
+		// decoder init or avcodec_flush_buffers.  BT.709 limited-range
+		// conversion of (Y=0, U=0, V=0) yields BGRA(0,77,0,255), a
 		// full-screen dark-green frame.  Valid NV12 chroma always centres on
 		// 128, so U=0 and V=0 simultaneously at the centre pixel is an
 		// unambiguous indicator of an uninitialised buffer.  Drop the frame
