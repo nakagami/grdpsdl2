@@ -222,11 +222,11 @@ func uploadYUVFrame(frame yuvFrame, texture *sdl.Texture, rect *sdl.Rect) {
 // inside play() for the duration of each conversion.
 type audioPlayer struct {
 	deviceID     sdl.AudioDeviceID
-	reopenNeeded atomic.Bool  // set from play() on "Invalid audio device ID"; cleared by reopen() on main thread
-	mu           sync.Mutex   // protects cvtKey, cvtNeed, cvtBuf
-	cvtKey       [3]int       // [SamplesPerSec, Channels, BitsPerSample] of the last-probed CVT
-	cvtNeed  bool       // true when the last-probed CVT actually transforms data
-	cvtBuf   []byte     // reusable scratch buffer for in-place conversion
+	reopenNeeded atomic.Bool // set from play() on "Invalid audio device ID"; cleared by reopen() on main thread
+	mu           sync.Mutex  // protects cvtKey, cvtNeed, cvtBuf
+	cvtKey       [3]int      // [SamplesPerSec, Channels, BitsPerSample] of the last-probed CVT
+	cvtNeed      bool        // true when the last-probed CVT actually transforms data
+	cvtBuf       []byte      // reusable scratch buffer for in-place conversion
 }
 
 // open opens the audio device on the calling (main) thread.
@@ -396,6 +396,87 @@ type yuvDone struct {
 	destX, destY, w, h int
 	isNull             bool // true when the decoded frame is all-zero (VideoToolbox flush/init artifact)
 	fullTexture        bool // true when the frame covered the full texture; UV is fully written — skip chroma init on next lock
+}
+
+// isNullYUVFrame returns true when a decoded YUV frame looks like a null or
+// corrupt decoder output that should not be rendered.
+//
+// Two patterns are detected:
+//
+//  1. All sampled Y, U and V values are exactly zero.  In limited-range YUV
+//     a legitimate black frame has Y≥16 and chroma=128, so Y=0 across the
+//     frame is a reliable marker for a null frame.
+//
+//  2. Both chroma planes are abnormally low (< lowChromaThreshold).  Valid
+//     desktop content keeps chroma centred near 128; both planes collapsing
+//     to ~0 is the green-monochrome corruption produced by stale IDR priming
+//     or an uninitialised decoder buffer.  The threshold matches grdp's SW
+//     fallback detector (72) so main.go catches any corrupt frames that slip
+//     through the decoder-side checks.
+//
+// For NV12 u and v point to the same interleaved UV plane; for I420 they
+// point to separate U and V planes.
+func isNullYUVFrame(y, u, v []byte) bool {
+	if len(y) == 0 || len(u) == 0 {
+		return false
+	}
+
+	const lowChromaThreshold = 72
+
+	// Sample 8 evenly-spaced values from each plane.
+	yStep := max(1, len(y)/8)
+	uStep := max(1, len(u)/8)
+	vStep := max(1, len(v)/8)
+
+	// Pattern 1: all-zero Y and chroma.
+	allYZero := true
+	for i := 0; i < len(y); i += yStep {
+		if y[i] != 0 {
+			allYZero = false
+			break
+		}
+	}
+	allUZero := true
+	for i := 0; i < len(u); i += uStep {
+		if u[i] != 0 {
+			allUZero = false
+			break
+		}
+	}
+	allVZero := true
+	if len(v) > 0 {
+		for i := 0; i < len(v); i += vStep {
+			if v[i] != 0 {
+				allVZero = false
+				break
+			}
+		}
+	} else {
+		allVZero = allUZero
+	}
+	if allYZero && allUZero && allVZero {
+		return true
+	}
+
+	// Pattern 2: near-zero chroma across the whole frame (green-monochrome
+	// corruption).  Skip when luma is also all-zero; that is either a genuine
+	// black frame or a warm-up frame handled by the decoder.
+	if allYZero {
+		return false
+	}
+	for i := 0; i < len(u); i += uStep {
+		if u[i] >= lowChromaThreshold {
+			return false
+		}
+	}
+	if len(v) > 0 {
+		for i := 0; i < len(v); i += vStep {
+			if v[i] >= lowChromaThreshold {
+				return false
+			}
+		}
+	}
+	return true
 }
 
 func mainLoop(hostPort, domain, user, password string, width, height int, swapAltMeta bool, keyboardType, keyboardLayout string, disableAVC444 bool) (err error) {
@@ -927,7 +1008,10 @@ func mainLoop(hostPort, domain, user, password string, width, height int, swapAl
 						// Y and UV byte will be overwritten — the next lock can skip
 						// the UV pre-initialisation (saves ~1 MB memset per frame).
 						fullTexture := fastPath && h == stage.th
-						isNull := false
+						isNull := isNullYUVFrame(y, uv, uv)
+						if isNull {
+							slog.Debug("YUV: holding previous frame (null/corrupt NV12 detected)")
+						}
 						// Clip copy height to texture dimensions: H.264 aligns frame
 						// height to 16-pixel multiples (e.g. 1072 for a 1060-row
 						// display), so h may exceed stage.th.  Copying the extra rows
@@ -998,13 +1082,17 @@ func mainLoop(hostPort, domain, user, password string, width, height int, swapAl
 					}
 					copy(buf[:yLen], y[:yLen])
 					copy(buf[yLen:yLen+uvLen], uv[:uvLen])
+					isNull := isNullYUVFrame(buf[:yLen], buf[yLen:yLen+uvLen], buf[yLen:yLen+uvLen])
+					if isNull {
+						slog.Debug("YUV: holding previous frame (null/corrupt NV12 detected)")
+					}
 					frame := yuvFrame{
 						destX: destX, destY: destY, w: w, h: h,
 						format: yuvTextureFormat,
 						y:      buf[:yLen], yStride: yStride,
-						uv:     buf[yLen : yLen+uvLen], uvStride: uvStride,
+						uv: buf[yLen : yLen+uvLen], uvStride: uvStride,
 						buf:    buf,
-						isNull: false,
+						isNull: isNull,
 					}
 					select {
 					case yuvCh <- frame:
@@ -1038,7 +1126,10 @@ func mainLoop(hostPort, domain, user, password string, width, height int, swapAl
 						vBaseLen := uBaseLen + uPitch*phTex
 						fastPath := stage.pitch == yStride && uPitch == uStride && destX == 0 && destY == 0
 						fullTexture := fastPath && h == stage.th
-						isNull := false
+						isNull := isNullYUVFrame(y, u, v)
+						if isNull {
+							slog.Debug("YUV: holding previous frame (null/corrupt I420 detected)")
+						}
 						// Clip copy height to texture dimensions (same rationale as NV12
 						// path: H.264 frame height rounds up to 16-pixel multiples, so h
 						// may exceed stage.th, causing buffer overflow and, in the parallel
@@ -1115,14 +1206,18 @@ func mainLoop(hostPort, domain, user, password string, width, height int, swapAl
 					copy(buf[:yLen], y[:yLen])
 					copy(buf[yLen:yLen+uLen], u[:uLen])
 					copy(buf[yLen+uLen:yLen+uLen+vLen], v[:vLen])
+					isNull := isNullYUVFrame(buf[:yLen], buf[yLen:yLen+uLen], buf[yLen+uLen:yLen+uLen+vLen])
+					if isNull {
+						slog.Debug("YUV: holding previous frame (null/corrupt I420 detected)")
+					}
 					frame := yuvFrame{
 						destX: destX, destY: destY, w: w, h: h,
 						format: yuvTextureFormat,
 						y:      buf[:yLen], yStride: yStride,
-						u:      buf[yLen : yLen+uLen], uStride: uStride,
-						v:      buf[yLen+uLen : yLen+uLen+vLen], vStride: vStride,
+						u: buf[yLen : yLen+uLen], uStride: uStride,
+						v: buf[yLen+uLen : yLen+uLen+vLen], vStride: vStride,
 						buf:    buf,
-						isNull: false,
+						isNull: isNull,
 					}
 					select {
 					case yuvCh <- frame:
