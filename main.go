@@ -398,65 +398,6 @@ type yuvDone struct {
 	fullTexture        bool // true when the frame covered the full texture; UV is fully written — skip chroma init on next lock
 }
 
-// isNullYUVFrame samples 8 evenly-spaced values from each of the Y and chroma
-// planes and returns true when the frame looks like a null/corrupt decoder
-// output.  Two patterns are detected:
-//
-//   1. All sampled Y and chroma values are exactly zero.  In limited-range
-//      YUV (the standard for H.264) a legitimate black frame has Y≥16 and
-//      chroma=128, so Y=0 across multiple samples is a reliable marker for a
-//      null frame.  In full-range YUV a black frame has Y=0 but chroma=128,
-//      so the chroma check prevents false positives.
-//
-//   2. All sampled chroma values are near zero (<24).  This catches
-//      green-monochrome corruption where the decoder produces valid luma but
-//      collapses the U/V planes to ~0.  Valid chroma is always centred near
-//      128, so near-zero chroma across the whole frame is never legitimate
-//      content.
-//
-// The O(16) cost is negligible compared to the frame copy.
-func isNullYUVFrame(y, chroma []byte) bool {
-	ny, nc := len(y), len(chroma)
-	if ny == 0 || nc == 0 {
-		return false // zero-length slices are handled upstream
-	}
-
-	// Pattern 1: all-zero Y and chroma.
-	allYZero := true
-	yStep := max(1, ny/8)
-	for i := 0; i < ny; i += yStep {
-		if y[i] != 0 {
-			allYZero = false
-			break
-		}
-	}
-	allChromaZero := true
-	cStep := max(1, nc/8)
-	for i := 0; i < nc; i += cStep {
-		if chroma[i] != 0 {
-			allChromaZero = false
-			break
-		}
-	}
-	if allYZero && allChromaZero {
-		return true
-	}
-
-	// Pattern 2: near-zero chroma across the whole frame (green-monochrome
-	// corruption).  We still require the luma plane to be non-trivial so we
-	// don't flag a real all-black frame; if Y is also all zero the first
-	// pattern already caught it.
-	if allYZero {
-		return false
-	}
-	for i := 0; i < nc; i += cStep {
-		if chroma[i] >= 24 {
-			return false
-		}
-	}
-	return true
-}
-
 func mainLoop(hostPort, domain, user, password string, width, height int, swapAltMeta bool, keyboardType, keyboardLayout string, disableAVC444 bool) (err error) {
 	cursorCache := make(map[uint16]*sdl.Cursor)
 	showCursor := true
@@ -986,7 +927,7 @@ func mainLoop(hostPort, domain, user, password string, width, height int, swapAl
 						// Y and UV byte will be overwritten — the next lock can skip
 						// the UV pre-initialisation (saves ~1 MB memset per frame).
 						fullTexture := fastPath && h == stage.th
-						isNull := isNullYUVFrame(y, uv)
+						isNull := false
 						// Clip copy height to texture dimensions: H.264 aligns frame
 						// height to 16-pixel multiples (e.g. 1072 for a 1060-row
 						// display), so h may exceed stage.th.  Copying the extra rows
@@ -1063,7 +1004,7 @@ func mainLoop(hostPort, domain, user, password string, width, height int, swapAl
 						y:      buf[:yLen], yStride: yStride,
 						uv:     buf[yLen : yLen+uvLen], uvStride: uvStride,
 						buf:    buf,
-						isNull: isNullYUVFrame(y, uv),
+						isNull: false,
 					}
 					select {
 					case yuvCh <- frame:
@@ -1097,7 +1038,7 @@ func mainLoop(hostPort, domain, user, password string, width, height int, swapAl
 						vBaseLen := uBaseLen + uPitch*phTex
 						fastPath := stage.pitch == yStride && uPitch == uStride && destX == 0 && destY == 0
 						fullTexture := fastPath && h == stage.th
-						isNull := isNullYUVFrame(y, u)
+						isNull := false
 						// Clip copy height to texture dimensions (same rationale as NV12
 						// path: H.264 frame height rounds up to 16-pixel multiples, so h
 						// may exceed stage.th, causing buffer overflow and, in the parallel
@@ -1181,7 +1122,7 @@ func mainLoop(hostPort, domain, user, password string, width, height int, swapAl
 						u:      buf[yLen : yLen+uLen], uStride: uStride,
 						v:      buf[yLen+uLen : yLen+uLen+vLen], vStride: vStride,
 						buf:    buf,
-						isNull: isNullYUVFrame(y, u),
+						isNull: false,
 					}
 					select {
 					case yuvCh <- frame:
