@@ -14,7 +14,7 @@ import (
 	"unsafe"
 
 	"github.com/nakagami/grdp"
-	_ "github.com/nakagami/grdpsdl2/plugin/rdpgfx/ffmpeg"
+	_ "github.com/nakagami/grdp/plugin/rdpgfx/ffmpeg"
 	"github.com/nakagami/grdp/plugin/rdpsnd"
 	"github.com/veandco/go-sdl2/sdl"
 )
@@ -399,26 +399,58 @@ type yuvDone struct {
 }
 
 // isNullYUVFrame samples 8 evenly-spaced values from each of the Y and chroma
-// planes and returns true only when every sampled value is zero.  In
-// limited-range YUV (the standard for H.264) a legitimate black frame has
-// Y≥16 and chroma=128, so Y=0 across multiple samples is a reliable marker
-// for a null/corrupt decoder output rather than real content.  In full-range
-// YUV a black frame has Y=0 but chroma=128, so the chroma check prevents
-// false positives.  The O(16) cost is negligible compared to the frame copy.
+// planes and returns true when the frame looks like a null/corrupt decoder
+// output.  Two patterns are detected:
+//
+//   1. All sampled Y and chroma values are exactly zero.  In limited-range
+//      YUV (the standard for H.264) a legitimate black frame has Y≥16 and
+//      chroma=128, so Y=0 across multiple samples is a reliable marker for a
+//      null frame.  In full-range YUV a black frame has Y=0 but chroma=128,
+//      so the chroma check prevents false positives.
+//
+//   2. All sampled chroma values are near zero (<24).  This catches
+//      green-monochrome corruption where the decoder produces valid luma but
+//      collapses the U/V planes to ~0.  Valid chroma is always centred near
+//      128, so near-zero chroma across the whole frame is never legitimate
+//      content.
+//
+// The O(16) cost is negligible compared to the frame copy.
 func isNullYUVFrame(y, chroma []byte) bool {
 	ny, nc := len(y), len(chroma)
 	if ny == 0 || nc == 0 {
 		return false // zero-length slices are handled upstream
 	}
+
+	// Pattern 1: all-zero Y and chroma.
+	allYZero := true
 	yStep := max(1, ny/8)
 	for i := 0; i < ny; i += yStep {
 		if y[i] != 0 {
-			return false
+			allYZero = false
+			break
 		}
 	}
+	allChromaZero := true
 	cStep := max(1, nc/8)
 	for i := 0; i < nc; i += cStep {
 		if chroma[i] != 0 {
+			allChromaZero = false
+			break
+		}
+	}
+	if allYZero && allChromaZero {
+		return true
+	}
+
+	// Pattern 2: near-zero chroma across the whole frame (green-monochrome
+	// corruption).  We still require the luma plane to be non-trivial so we
+	// don't flag a real all-black frame; if Y is also all zero the first
+	// pattern already caught it.
+	if allYZero {
+		return false
+	}
+	for i := 0; i < nc; i += cStep {
+		if chroma[i] >= 24 {
 			return false
 		}
 	}
