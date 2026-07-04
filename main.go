@@ -808,6 +808,20 @@ func mainLoop(hostPort, domain, user, password string, width, height int, swapAl
 	// Zero means no server activity yet (watchdog disarmed).
 	var lastServerActivity atomic.Int64
 
+	// lastYUVFrameTime records the main-loop time when the most recent
+	// H.264 YUV frame was processed (including null frames that are dropped
+	// before rendering).  Used by the SW fallback BGRA watchdog to detect
+	// when the hardware decoder has stopped delivering YUV frames.  Zero
+	// means no YUV frame has been processed yet.
+	var lastYUVFrameTime atomic.Int64
+	// fullScreenBitmapStartTime records when the current streak of full-screen
+	// BGRA bitmap patches began.  Zero means no streak is active.
+	var fullScreenBitmapStartTime atomic.Int64
+	// lastFullScreenBitmapTime records the most recent full-screen BGRA
+	// bitmap patch.  Used to ensure the streak is still alive before
+	// triggering a reconnect.
+	var lastFullScreenBitmapTime atomic.Int64
+
 	// Register a custom SDL event type to wake the main loop when bitmaps arrive.
 	bitmapEventType := sdl.RegisterEvents(1)
 	// Pre-allocate wake events once so callbacks never heap-allocate on the hot path.
@@ -1248,6 +1262,16 @@ func mainLoop(hostPort, domain, user, password string, width, height int, swapAl
 	// truly stuck session.
 	const videoStallTimeout = 10 * time.Second
 
+	// swFallbackBGRATimeout is the maximum duration we allow the session to
+	// render via full-screen BGRA bitmap patches without any YUV frames.
+	// When the H.264 hardware decoder stalls, grdp falls back to software
+	// decoding; the SW decoder is primed with a stale cached IDR and often
+	// produces block-noise/mosaic frames that never resync.  A reconnect
+	// recreates the hardware decoder and usually clears the corruption.
+	// This watchdog only arms after at least one YUV frame has been seen,
+	// so BGRA-only sessions are not affected.
+	const swFallbackBGRATimeout = 5 * time.Second
+
 	// renderDirty counts down from 3 to 0.  It is set to 3 whenever new content
 	// arrives (YUV frame, bitmap patch, or reconnect).  The render trio
 	// (Clear/Copy/Present) is only called while renderDirty > 0, and is
@@ -1261,6 +1285,7 @@ func mainLoop(hostPort, domain, user, password string, width, height int, swapAl
 	// successful Reconnect.  Extracted to avoid duplicating ~25 lines between
 	// the resize-reconnect and video-stall-reconnect paths.
 	resetAfterReconnect := func(w, h int32) {
+		width, height = int(w), int(h)
 		lastServerActivity.Store(0)
 		connectionErrorPending.Store(false)
 		overlayDirtyRects = overlayDirtyRects[:0]
@@ -1295,6 +1320,9 @@ func mainLoop(hostPort, domain, user, password string, width, height int, swapAl
 		}
 		yuvReady = false
 		yuvTextureIsNull = false
+		lastYUVFrameTime.Store(0)
+		fullScreenBitmapStartTime.Store(0)
+		lastFullScreenBitmapTime.Store(0)
 		ap.reopenNeeded.Store(false)
 		ap.reset()
 		renderDirty = 3
@@ -1440,6 +1468,9 @@ func mainLoop(hostPort, domain, user, password string, width, height int, swapAl
 				} else {
 					yuvTextureIsNull = true
 				}
+				lastYUVFrameTime.Store(nowNs)
+				fullScreenBitmapStartTime.Store(0)
+				lastFullScreenBitmapTime.Store(0)
 				renderDirty = 3
 			default:
 			}
@@ -1475,6 +1506,9 @@ func mainLoop(hostPort, domain, user, password string, width, height int, swapAl
 					yuvReady = true
 					yuvTextureIsNull = false
 				}
+				lastYUVFrameTime.Store(nowNs)
+				fullScreenBitmapStartTime.Store(0)
+				lastFullScreenBitmapTime.Store(0)
 				renderDirty = 3
 			}
 		}
@@ -1498,6 +1532,28 @@ func mainLoop(hostPort, domain, user, password string, width, height int, swapAl
 			paintImages(allBitmaps, texture, width, height, &overlayDirtyRects)
 			if len(overlayDirtyRects) > prevLen {
 				overlayHasContent = true
+			}
+			// Track full-screen BGRA patches for the SW fallback watchdog.
+			// A full-screen patch covering the whole window usually means the
+			// server is sending video as BGRA because the H.264 hardware decoder
+			// has stalled and grdp fell back to software decoding.
+			hasFullScreen := false
+			for _, bm := range allBitmaps {
+				patchW := bm.DestRight - bm.DestLeft + 1
+				patchH := bm.DestBottom - bm.DestTop + 1
+				if patchW >= width && patchH >= height {
+					hasFullScreen = true
+					break
+				}
+			}
+			if hasFullScreen {
+				if fullScreenBitmapStartTime.Load() == 0 {
+					fullScreenBitmapStartTime.Store(nowNs)
+				}
+				lastFullScreenBitmapTime.Store(nowNs)
+			} else {
+				fullScreenBitmapStartTime.Store(0)
+				lastFullScreenBitmapTime.Store(0)
 			}
 			for i := range allBitmaps {
 				bitmapBufPool.Put(allBitmaps[i].Data)
@@ -1603,6 +1659,39 @@ func mainLoop(hostPort, domain, user, password string, width, height int, swapAl
 				}
 			}
 		}
+
+		// SW fallback BGRA watchdog: when the hardware decoder stalls, grdp
+		// falls back to software decoding and the server sends full-screen BGRA
+		// bitmap patches.  The SW decoder is primed with a stale cached IDR and
+		// often produces persistent block-noise/mosaic frames that never resync
+		// on their own.  If full-screen BGRA patches keep arriving but no YUV
+		// frame has been processed for swFallbackBGRATimeout, reconnect to
+		// recreate the hardware decoder.  The watchdog only arms after at least
+		// one YUV frame has been seen, so BGRA-only sessions are unaffected.
+		if !resizePending && reconnecting.Load() == 0 {
+			startNs := fullScreenBitmapStartTime.Load()
+			lastFSNs := lastFullScreenBitmapTime.Load()
+			lastYUVNs := lastYUVFrameTime.Load()
+			if startNs != 0 && lastFSNs != 0 && lastYUVNs != 0 {
+				yuvIdle := nowNs - lastYUVNs
+				fsRecent := nowNs - lastFSNs
+				if yuvIdle > int64(swFallbackBGRATimeout) && fsRecent < int64(time.Second) {
+					w, h := window.GetSize()
+					slog.Warn("SW fallback BGRA persisted, reconnecting to recover HW decoder",
+						"yuvIdle", time.Duration(yuvIdle).Round(time.Millisecond),
+						"width", w, "height", h)
+					reconnecting.Store(1)
+					reconnErr := rdpClient.Reconnect(int(w), int(h))
+					reconnecting.Store(0)
+					if reconnErr != nil {
+						slog.Error("Reconnect (SW fallback BGRA) failed", "err", reconnErr)
+					} else {
+						resetAfterReconnect(w, h)
+					}
+				}
+			}
+		}
+
 		// Audio device recovery: play() sets reopenNeeded when SDL2 reports
 		// "Invalid audio device ID" (macOS Core Audio sometimes invalidates the
 		// device after many reconnects).  Reopen on the main thread to satisfy
