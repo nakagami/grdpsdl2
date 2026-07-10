@@ -808,6 +808,16 @@ func mainLoop(hostPort, domain, user, password string, width, height int, swapAl
 	// Zero means no server activity yet (watchdog disarmed).
 	var lastServerActivity atomic.Int64
 
+	// everShowedFrame is set once a genuine (non-null, non-dropped) video
+	// frame has been rendered at least once.  The video-stall watchdog below
+	// normally assumes a silent stream just means an idle remote desktop and
+	// does not reconnect — but that assumption only holds once the session
+	// has actually shown something.  If the server goes silent for
+	// videoStallTimeout before we have ever shown a real frame, the session
+	// is stuck (e.g. the decoder never recovered and the server also stopped
+	// responding), not idle, so the watchdog should reconnect unconditionally.
+	var everShowedFrame atomic.Bool
+
 	// lastYUVFrameTime records the main-loop time when the most recent
 	// H.264 YUV frame was processed (including null frames that are dropped
 	// before rendering).  Used by the SW fallback BGRA watchdog to detect
@@ -905,6 +915,9 @@ func mainLoop(hostPort, domain, user, password string, width, height int, swapAl
 		ap.reset()
 	}).OnBitmap(func(bs []grdp.Bitmap) {
 		lastServerActivity.Store(time.Now().UnixNano())
+		if len(bs) > 0 {
+			everShowedFrame.Store(true)
+		}
 		// Bitmap.Data is borrowed from grdp's internal pool; copy it before
 		// returning from this callback.  Reuse pooled buffers to avoid
 		// allocating fresh backing arrays on every frame.
@@ -1025,6 +1038,8 @@ func mainLoop(hostPort, domain, user, password string, width, height int, swapAl
 						isNull := isNullYUVFrame(y, uv, uv)
 						if isNull {
 							slog.Debug("YUV: holding previous frame (null/corrupt NV12 detected)")
+						} else {
+							everShowedFrame.Store(true)
 						}
 						// Clip copy height to texture dimensions: H.264 aligns frame
 						// height to 16-pixel multiples (e.g. 1072 for a 1060-row
@@ -1099,6 +1114,8 @@ func mainLoop(hostPort, domain, user, password string, width, height int, swapAl
 					isNull := isNullYUVFrame(buf[:yLen], buf[yLen:yLen+uvLen], buf[yLen:yLen+uvLen])
 					if isNull {
 						slog.Debug("YUV: holding previous frame (null/corrupt NV12 detected)")
+					} else {
+						everShowedFrame.Store(true)
 					}
 					frame := yuvFrame{
 						destX: destX, destY: destY, w: w, h: h,
@@ -1143,6 +1160,8 @@ func mainLoop(hostPort, domain, user, password string, width, height int, swapAl
 						isNull := isNullYUVFrame(y, u, v)
 						if isNull {
 							slog.Debug("YUV: holding previous frame (null/corrupt I420 detected)")
+						} else {
+							everShowedFrame.Store(true)
 						}
 						// Clip copy height to texture dimensions (same rationale as NV12
 						// path: H.264 frame height rounds up to 16-pixel multiples, so h
@@ -1223,6 +1242,8 @@ func mainLoop(hostPort, domain, user, password string, width, height int, swapAl
 					isNull := isNullYUVFrame(buf[:yLen], buf[yLen:yLen+uLen], buf[yLen+uLen:yLen+uLen+vLen])
 					if isNull {
 						slog.Debug("YUV: holding previous frame (null/corrupt I420 detected)")
+					} else {
+						everShowedFrame.Store(true)
 					}
 					frame := yuvFrame{
 						destX: destX, destY: destY, w: w, h: h,
@@ -1636,14 +1657,25 @@ func mainLoop(hostPort, domain, user, password string, width, height int, swapAl
 		// Video watchdog: reconnect if a connection error was reported and the
 		// session has been silent for videoStallTimeout; otherwise just log
 		// (the remote desktop may legitimately be idle for long periods).
+		// The "legitimately idle" assumption only holds once the session has
+		// shown a real frame at least once — a session that has been silent
+		// since connecting, without ever rendering anything, is stuck (e.g.
+		// the decoder never recovered and the server also stopped
+		// responding), so treat that case like a connection-error stall too.
 		lastNS := lastServerActivity.Load()
 		if lastNS != 0 && !resizePending {
 			elapsed := time.Duration(nowNs - lastNS)
 			if elapsed > videoStallTimeout {
-				if connectionErrorPending.CompareAndSwap(true, false) {
+				neverShown := !everShowedFrame.Load()
+				if connectionErrorPending.CompareAndSwap(true, false) || neverShown {
 					w, h := window.GetSize()
-					slog.Warn("Video stalled after connection error, reconnecting",
-						"stalled", elapsed.Round(time.Millisecond), "width", w, "height", h)
+					if neverShown {
+						slog.Warn("Video stalled without ever showing a frame, reconnecting",
+							"stalled", elapsed.Round(time.Millisecond), "width", w, "height", h)
+					} else {
+						slog.Warn("Video stalled after connection error, reconnecting",
+							"stalled", elapsed.Round(time.Millisecond), "width", w, "height", h)
+					}
 					reconnecting.Store(1)
 					reconnErr := rdpClient.Reconnect(int(w), int(h))
 					reconnecting.Store(0)
