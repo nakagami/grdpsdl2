@@ -1283,6 +1283,24 @@ func mainLoop(hostPort, domain, user, password string, width, height int, swapAl
 	// truly stuck session.
 	const videoStallTimeout = 10 * time.Second
 
+	// Black-screen recovery ladder constants.  When the session has never shown
+	// a frame, the server may have encoded its first IDR before the desktop
+	// finished painting — that IDR decodes to a black warm-up frame and is
+	// dropped, after which the server goes idle and sends nothing more.  Rather
+	// than waiting videoStallTimeout and paying for a full reconnect (which
+	// restarts the HW decoder cold and often reproduces the same black burst),
+	// we first ask the server to resend the now-painted screen with a
+	// lightweight ForceRefresh keyframe request, and only reconnect if several
+	// keyframe requests still fail to produce a frame.
+	//   grace: let normal warm-up complete before intervening.
+	//   interval: spacing between keyframe requests (and before the reconnect).
+	//   maxReqs: number of ForceRefresh attempts before escalating to reconnect.
+	const (
+		blackScreenKeyframeGrace    = 1500 * time.Millisecond
+		blackScreenKeyframeInterval = 2 * time.Second
+		blackScreenMaxKeyframeReqs  = 4
+	)
+
 	// swFallbackBGRATimeout is the maximum duration we allow the session to
 	// render via full-screen BGRA bitmap patches without any YUV frames.
 	// When the H.264 hardware decoder stalls, grdp falls back to software
@@ -1353,6 +1371,14 @@ func mainLoop(hostPort, domain, user, password string, width, height int, swapAl
 	var resizePending bool
 	var resizeTime time.Time
 	var resizeW, resizeH int32
+	// Black-screen recovery ladder state (see blackScreenKeyframe* constants).
+	// neverShownSinceNs marks when the current all-black period began (0 when a
+	// frame has been shown); lastKeyframeReqNs rate-limits ForceRefresh requests
+	// and seeds the initial grace period; keyframeAttempts counts requests sent
+	// before escalating to a reconnect.
+	var neverShownSinceNs int64
+	var lastKeyframeReqNs int64
+	var keyframeAttempts int
 	// allBitmaps accumulates bitmaps drained from bitmapCh each render tick.
 	// Declared outside the loop so the backing array is reused across ticks.
 	var allBitmaps []grdp.Bitmap
@@ -1654,28 +1680,61 @@ func mainLoop(hostPort, domain, user, password string, width, height int, swapAl
 			}
 		}
 
+		// Black-screen recovery ladder: when the session has never shown a frame,
+		// try lightweight ForceRefresh keyframe requests before escalating to a
+		// full reconnect (see blackScreenKeyframe* constants).  This owns the
+		// "never shown a frame" recovery path; the stall watchdog below handles
+		// only post-connection-error stalls once a frame has been shown.
+		if everShowedFrame.Load() {
+			neverShownSinceNs = 0
+			keyframeAttempts = 0
+		} else if !resizePending && reconnecting.Load() == 0 {
+			if neverShownSinceNs == 0 {
+				neverShownSinceNs = nowNs
+				lastKeyframeReqNs = nowNs // begin the initial grace period
+			}
+			sinceStart := time.Duration(nowNs - neverShownSinceNs)
+			sinceKf := time.Duration(nowNs - lastKeyframeReqNs)
+			if keyframeAttempts < blackScreenMaxKeyframeReqs {
+				if sinceStart >= blackScreenKeyframeGrace && sinceKf >= blackScreenKeyframeInterval {
+					slog.Warn("Black screen, requesting keyframe (force refresh)",
+						"sinceStart", sinceStart.Round(time.Millisecond), "attempt", keyframeAttempts+1)
+					rdpClient.RequestKeyframe()
+					lastKeyframeReqNs = nowNs
+					keyframeAttempts++
+				}
+			} else if sinceKf >= blackScreenKeyframeInterval {
+				// ForceRefresh attempts exhausted — escalate to a full reconnect.
+				w, h := window.GetSize()
+				slog.Warn("Black screen persists after keyframe requests, reconnecting",
+					"attempts", keyframeAttempts, "width", w, "height", h)
+				reconnecting.Store(1)
+				reconnErr := rdpClient.Reconnect(int(w), int(h))
+				reconnecting.Store(0)
+				if reconnErr != nil {
+					slog.Error("Reconnect (black screen) failed", "err", reconnErr)
+				} else {
+					resetAfterReconnect(w, h)
+				}
+				neverShownSinceNs = 0
+				keyframeAttempts = 0
+			}
+		}
+
 		// Video watchdog: reconnect if a connection error was reported and the
 		// session has been silent for videoStallTimeout; otherwise just log
-		// (the remote desktop may legitimately be idle for long periods).
-		// The "legitimately idle" assumption only holds once the session has
-		// shown a real frame at least once — a session that has been silent
-		// since connecting, without ever rendering anything, is stuck (e.g.
-		// the decoder never recovered and the server also stopped
-		// responding), so treat that case like a connection-error stall too.
+		// (the remote desktop may legitimately be idle for long periods).  The
+		// never-shown-a-frame case is handled by the black-screen ladder above,
+		// so this path only fires once a frame has been shown and a connection
+		// error is pending.
 		lastNS := lastServerActivity.Load()
 		if lastNS != 0 && !resizePending {
 			elapsed := time.Duration(nowNs - lastNS)
 			if elapsed > videoStallTimeout {
-				neverShown := !everShowedFrame.Load()
-				if connectionErrorPending.CompareAndSwap(true, false) || neverShown {
+				if connectionErrorPending.CompareAndSwap(true, false) {
 					w, h := window.GetSize()
-					if neverShown {
-						slog.Warn("Video stalled without ever showing a frame, reconnecting",
-							"stalled", elapsed.Round(time.Millisecond), "width", w, "height", h)
-					} else {
-						slog.Warn("Video stalled after connection error, reconnecting",
-							"stalled", elapsed.Round(time.Millisecond), "width", w, "height", h)
-					}
+					slog.Warn("Video stalled after connection error, reconnecting",
+						"stalled", elapsed.Round(time.Millisecond), "width", w, "height", h)
 					reconnecting.Store(1)
 					reconnErr := rdpClient.Reconnect(int(w), int(h))
 					reconnecting.Store(0)
@@ -1685,7 +1744,7 @@ func mainLoop(hostPort, domain, user, password string, width, height int, swapAl
 					} else {
 						resetAfterReconnect(w, h)
 					}
-				} else {
+				} else if everShowedFrame.Load() {
 					slog.Warn("Video stalled", "stalled", elapsed.Round(time.Millisecond))
 					lastServerActivity.Store(nowNs) // reset to avoid repeated log spam
 				}
