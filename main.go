@@ -818,6 +818,31 @@ func mainLoop(hostPort, domain, user, password string, width, height int, swapAl
 	// responding), not idle, so the watchdog should reconnect unconditionally.
 	var everShowedFrame atomic.Bool
 
+	// neverShownConnectNs marks when the current connection attempt began
+	// (set at the initial connect and reset after every successful
+	// reconnect).  Unlike lastServerActivity — which ANY server traffic
+	// (pointer cursor updates, audio, clipboard) keeps refreshing even while
+	// no video frame has ever been shown — this timestamp is untouched by
+	// such non-video traffic.  A busy cursor animation can otherwise keep
+	// lastServerActivity "fresh" indefinitely, masking a truly stuck black
+	// screen from the stall watchdog below.  Using a dedicated clock for the
+	// never-shown-a-frame case makes it fire reliably after videoStallTimeout
+	// regardless of how much non-video traffic the server sends.
+	neverShownConnectNs := time.Now().UnixNano()
+
+	// neverShownKeyframeSent tracks whether the single mid-warm-up ForceRefresh
+	// (RequestKeyframe) attempt below has already been sent for the current
+	// connection attempt.  Reset alongside neverShownConnectNs.  Traffic
+	// capture shows the server sends ~0.5s of black warm-up frames and then
+	// goes completely silent (no traffic on ANY channel) for many seconds
+	// until a full reconnect — a single ForceRefresh part-way through that
+	// silence, well after the warm-up burst has settled, nudges the server to
+	// resend the painted desktop.  A prior attempt sent 4 requests every 2s
+	// starting 1.5s in (overlapping the still-active warm-up burst) and that
+	// caused visible corruption; sending exactly one request, later, avoids
+	// racing the burst.
+	neverShownKeyframeSent := false
+
 	// lastYUVFrameTime records the main-loop time when the most recent
 	// H.264 YUV frame was processed (including null frames that are dropped
 	// before rendering).  Used by the SW fallback BGRA watchdog to detect
@@ -1013,7 +1038,6 @@ func mainLoop(hostPort, domain, user, password string, width, height int, swapAl
 	if yuvTexture != nil {
 		if yuvTextureFormat == sdlPixelFormatNV12 {
 			rdpClient.OnH264NV12(func(destX, destY, w, h int, y []byte, yStride int, uv []byte, uvStride int) {
-				lastServerActivity.Store(time.Now().UnixNano())
 				if yuvPrimaryPath {
 					// Primary path: write grdp data directly into the pre-locked
 					// Metal staging buffer (one copy: grdp → MTLBuffer).
@@ -1040,6 +1064,14 @@ func mainLoop(hostPort, domain, user, password string, width, height int, swapAl
 							slog.Debug("YUV: holding previous frame (null/corrupt NV12 detected)")
 						} else {
 							everShowedFrame.Store(true)
+							// Only count genuine (non-null) frames as activity here:
+							// the server keeps sending all-black warm-up frames
+							// (Y=0,U=128,V=128) at a steady cadence while the desktop
+							// finishes painting, and touching lastServerActivity for
+							// those would keep resetting the stall watchdog below,
+							// so the never-shown-a-frame case would never time out
+							// and reconnect.
+							lastServerActivity.Store(time.Now().UnixNano())
 						}
 						// Clip copy height to texture dimensions: H.264 aligns frame
 						// height to 16-pixel multiples (e.g. 1072 for a 1060-row
@@ -1116,6 +1148,7 @@ func mainLoop(hostPort, domain, user, password string, width, height int, swapAl
 						slog.Debug("YUV: holding previous frame (null/corrupt NV12 detected)")
 					} else {
 						everShowedFrame.Store(true)
+						lastServerActivity.Store(time.Now().UnixNano())
 					}
 					frame := yuvFrame{
 						destX: destX, destY: destY, w: w, h: h,
@@ -1139,7 +1172,6 @@ func mainLoop(hostPort, domain, user, password string, width, height int, swapAl
 			})
 		} else {
 			rdpClient.OnH264I420(func(destX, destY, w, h int, y []byte, yStride int, u []byte, uStride int, v []byte, vStride int) {
-				lastServerActivity.Store(time.Now().UnixNano())
 				if yuvPrimaryPath {
 					// Add to WaitGroup BEFORE the select (same rationale as NV12 path).
 					yuvWriteWg.Add(1)
@@ -1162,6 +1194,11 @@ func mainLoop(hostPort, domain, user, password string, width, height int, swapAl
 							slog.Debug("YUV: holding previous frame (null/corrupt I420 detected)")
 						} else {
 							everShowedFrame.Store(true)
+							// See the NV12 handler above: skip activity tracking for
+							// null warm-up frames so the stall watchdog's
+							// never-shown-a-frame case isn't perpetually reset by
+							// them.
+							lastServerActivity.Store(time.Now().UnixNano())
 						}
 						// Clip copy height to texture dimensions (same rationale as NV12
 						// path: H.264 frame height rounds up to 16-pixel multiples, so h
@@ -1244,6 +1281,7 @@ func mainLoop(hostPort, domain, user, password string, width, height int, swapAl
 						slog.Debug("YUV: holding previous frame (null/corrupt I420 detected)")
 					} else {
 						everShowedFrame.Store(true)
+						lastServerActivity.Store(time.Now().UnixNano())
 					}
 					frame := yuvFrame{
 						destX: destX, destY: destY, w: w, h: h,
@@ -1283,23 +1321,19 @@ func mainLoop(hostPort, domain, user, password string, width, height int, swapAl
 	// truly stuck session.
 	const videoStallTimeout = 10 * time.Second
 
-	// Black-screen recovery ladder constants.  When the session has never shown
-	// a frame, the server may have encoded its first IDR before the desktop
-	// finished painting — that IDR decodes to a black warm-up frame and is
-	// dropped, after which the server goes idle and sends nothing more.  Rather
-	// than waiting videoStallTimeout and paying for a full reconnect (which
-	// restarts the HW decoder cold and often reproduces the same black burst),
-	// we first ask the server to resend the now-painted screen with a
-	// lightweight ForceRefresh keyframe request, and only reconnect if several
-	// keyframe requests still fail to produce a frame.
-	//   grace: let normal warm-up complete before intervening.
-	//   interval: spacing between keyframe requests (and before the reconnect).
-	//   maxReqs: number of ForceRefresh attempts before escalating to reconnect.
-	const (
-		blackScreenKeyframeGrace    = 1500 * time.Millisecond
-		blackScreenKeyframeInterval = 2 * time.Second
-		blackScreenMaxKeyframeReqs  = 4
-	)
+	// neverShownKeyframeGrace is how long into a still-never-shown-a-frame
+	// connection attempt we wait before sending a single ForceRefresh
+	// (RequestKeyframe) request, ahead of the full videoStallTimeout
+	// reconnect.  Traffic capture shows the server sends roughly half a
+	// second of black warm-up frames and then goes completely silent (no
+	// traffic on any channel, not just video) for several seconds — the
+	// warm-up burst is reliably over well before this grace elapses, so a
+	// single request here does not race it (an earlier attempt sent 4
+	// requests every 2s starting at 1.5s, which did race the burst and
+	// produced visibly corrupted frames).  Must be comfortably less than
+	// videoStallTimeout to leave time for the server to respond before the
+	// reconnect fires.
+	const neverShownKeyframeGrace = 4 * time.Second
 
 	// swFallbackBGRATimeout is the maximum duration we allow the session to
 	// render via full-screen BGRA bitmap patches without any YUV frames.
@@ -1326,6 +1360,8 @@ func mainLoop(hostPort, domain, user, password string, width, height int, swapAl
 	resetAfterReconnect := func(w, h int32) {
 		width, height = int(w), int(h)
 		lastServerActivity.Store(0)
+		neverShownConnectNs = time.Now().UnixNano()
+		neverShownKeyframeSent = false
 		connectionErrorPending.Store(false)
 		overlayDirtyRects = overlayDirtyRects[:0]
 		overlayHasContent = false
@@ -1371,14 +1407,6 @@ func mainLoop(hostPort, domain, user, password string, width, height int, swapAl
 	var resizePending bool
 	var resizeTime time.Time
 	var resizeW, resizeH int32
-	// Black-screen recovery ladder state (see blackScreenKeyframe* constants).
-	// neverShownSinceNs marks when the current all-black period began (0 when a
-	// frame has been shown); lastKeyframeReqNs rate-limits ForceRefresh requests
-	// and seeds the initial grace period; keyframeAttempts counts requests sent
-	// before escalating to a reconnect.
-	var neverShownSinceNs int64
-	var lastKeyframeReqNs int64
-	var keyframeAttempts int
 	// allBitmaps accumulates bitmaps drained from bitmapCh each render tick.
 	// Declared outside the loop so the backing array is reused across ticks.
 	var allBitmaps []grdp.Bitmap
@@ -1680,53 +1708,56 @@ func mainLoop(hostPort, domain, user, password string, width, height int, swapAl
 			}
 		}
 
-		// Black-screen recovery ladder: when the session has never shown a frame,
-		// try lightweight ForceRefresh keyframe requests before escalating to a
-		// full reconnect (see blackScreenKeyframe* constants).  This owns the
-		// "never shown a frame" recovery path; the stall watchdog below handles
-		// only post-connection-error stalls once a frame has been shown.
-		if everShowedFrame.Load() {
-			neverShownSinceNs = 0
-			keyframeAttempts = 0
-		} else if !resizePending && reconnecting.Load() == 0 {
-			if neverShownSinceNs == 0 {
-				neverShownSinceNs = nowNs
-				lastKeyframeReqNs = nowNs // begin the initial grace period
+		// Never-shown-a-frame watchdog: reconnect once videoStallTimeout has
+		// elapsed since the current connection attempt began, if we still
+		// haven't shown a real frame.  This uses its own clock
+		// (neverShownConnectNs) rather than lastServerActivity, because
+		// lastServerActivity is refreshed by ANY server traffic — pointer
+		// cursor updates in particular can arrive continuously (e.g. a
+		// blinking/animated cursor) even while the video stream itself is
+		// stuck on a dropped black warm-up frame, which would otherwise keep
+		// resetting the stall clock and prevent this from ever firing.
+		//
+		// Before giving up and reconnecting, send a single ForceRefresh
+		// keyframe request at neverShownKeyframeGrace: the server goes
+		// completely silent after its initial black warm-up burst, and this
+		// lightweight nudge can make it resend the now-painted desktop
+		// without paying for a full reconnect.  Only one request is sent
+		// (unlike the earlier 4-requests-every-2s ladder, which started
+		// during the still-active warm-up burst and produced visibly
+		// corrupted frames) — if it doesn't help, the reconnect below still
+		// fires at videoStallTimeout.
+		if !everShowedFrame.Load() && !resizePending {
+			neverShownElapsed := time.Duration(nowNs - neverShownConnectNs)
+			if !neverShownKeyframeSent && neverShownElapsed >= neverShownKeyframeGrace {
+				slog.Warn("Black screen, sending single ForceRefresh keyframe request",
+					"sinceStart", neverShownElapsed.Round(time.Millisecond))
+				rdpClient.RequestKeyframe()
+				neverShownKeyframeSent = true
 			}
-			sinceStart := time.Duration(nowNs - neverShownSinceNs)
-			sinceKf := time.Duration(nowNs - lastKeyframeReqNs)
-			if keyframeAttempts < blackScreenMaxKeyframeReqs {
-				if sinceStart >= blackScreenKeyframeGrace && sinceKf >= blackScreenKeyframeInterval {
-					slog.Warn("Black screen, requesting keyframe (force refresh)",
-						"sinceStart", sinceStart.Round(time.Millisecond), "attempt", keyframeAttempts+1)
-					rdpClient.RequestKeyframe()
-					lastKeyframeReqNs = nowNs
-					keyframeAttempts++
-				}
-			} else if sinceKf >= blackScreenKeyframeInterval {
-				// ForceRefresh attempts exhausted — escalate to a full reconnect.
+			if neverShownElapsed > videoStallTimeout {
 				w, h := window.GetSize()
-				slog.Warn("Black screen persists after keyframe requests, reconnecting",
-					"attempts", keyframeAttempts, "width", w, "height", h)
+				slog.Warn("Video stalled without ever showing a frame, reconnecting",
+					"stalled", neverShownElapsed.Round(time.Millisecond), "width", w, "height", h)
 				reconnecting.Store(1)
 				reconnErr := rdpClient.Reconnect(int(w), int(h))
 				reconnecting.Store(0)
 				if reconnErr != nil {
-					slog.Error("Reconnect (black screen) failed", "err", reconnErr)
+					slog.Error("Reconnect (never shown) failed", "err", reconnErr)
+					neverShownConnectNs = nowNs // retry next stall cycle
+					neverShownKeyframeSent = false
 				} else {
 					resetAfterReconnect(w, h)
 				}
-				neverShownSinceNs = 0
-				keyframeAttempts = 0
 			}
 		}
 
 		// Video watchdog: reconnect if a connection error was reported and the
 		// session has been silent for videoStallTimeout; otherwise just log
-		// (the remote desktop may legitimately be idle for long periods).  The
-		// never-shown-a-frame case is handled by the black-screen ladder above,
-		// so this path only fires once a frame has been shown and a connection
-		// error is pending.
+		// (the remote desktop may legitimately be idle for long periods).
+		// The never-shown-a-frame case is handled by the watchdog above, so
+		// this one only needs to cover a stall after a real frame has already
+		// been shown.
 		lastNS := lastServerActivity.Load()
 		if lastNS != 0 && !resizePending {
 			elapsed := time.Duration(nowNs - lastNS)
@@ -1744,7 +1775,7 @@ func mainLoop(hostPort, domain, user, password string, width, height int, swapAl
 					} else {
 						resetAfterReconnect(w, h)
 					}
-				} else if everShowedFrame.Load() {
+				} else {
 					slog.Warn("Video stalled", "stalled", elapsed.Round(time.Millisecond))
 					lastServerActivity.Store(nowNs) // reset to avoid repeated log spam
 				}
