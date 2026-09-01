@@ -38,6 +38,13 @@ const h264DropCooldown = time.Second
 // accordingly.  0 = no congestion, 0xFFFFFFFF = pause entirely.
 const h264CongestionHint uint32 = 20
 
+func abs(x int) int {
+	if x < 0 {
+		return -x
+	}
+	return x
+}
+
 // fillBytes sets every element of s to v using a doubling-copy strategy.
 // copy() is implemented with SIMD instructions (NEON on ARM64, AVX on x86),
 // so this is O(log n) SIMD copies instead of O(n) scalar writes —
@@ -49,6 +56,18 @@ func fillBytes(s []byte, v byte) {
 	s[0] = v
 	for i := 1; i < len(s); i *= 2 {
 		copy(s[i:], s[:i])
+	}
+}
+
+// ensureOpaqueBGRA sets the alpha byte (offset +3) of every 32-bit pixel in
+// data to 0xFF (opaque). RDP 32bpp bitmaps (XRGB/BGRX) typically carry 0x00 in
+// the alpha byte; because the overlay texture uses SDL_BLENDMODE_BLEND, an
+// alpha of 0x00 renders as completely transparent and lets the underlying
+// YUV plane show through, causing green/black artifacts on mouse hover/movement.
+func ensureOpaqueBGRA(data []byte) {
+	n := len(data) / 4
+	for i := range n {
+		data[i*4+3] = 0xFF
 	}
 }
 
@@ -72,6 +91,7 @@ func paintImages(bs []grdp.Bitmap, texture *sdl.Texture, width, height int, dirt
 			if len(bgraBuf) == 0 {
 				continue
 			}
+			ensureOpaqueBGRA(bgraBuf)
 			w := min(bm.DestRight-bm.DestLeft+1, bm.Width)
 			h := min(bm.DestBottom-bm.DestTop+1, bm.Height)
 			rect := sdl.Rect{X: int32(bm.DestLeft), Y: int32(bm.DestTop), W: int32(w), H: int32(h)}
@@ -84,6 +104,7 @@ func paintImages(bs []grdp.Bitmap, texture *sdl.Texture, width, height int, dirt
 		if len(bm.Data) == 0 {
 			continue
 		}
+		ensureOpaqueBGRA(bm.Data)
 		w := min(bm.DestRight-bm.DestLeft+1, bm.Width)
 		h := min(bm.DestBottom-bm.DestTop+1, bm.Height)
 		if w <= 0 || h <= 0 {
@@ -98,18 +119,65 @@ func paintImages(bs []grdp.Bitmap, texture *sdl.Texture, width, height int, dirt
 		}
 		srcCol := x0 - bm.DestLeft
 		srcRow := y0 - bm.DestTop
-		slog.Debug("paintImages bitmap",
-			"dest", fmt.Sprintf("%d,%d-%d,%d", bm.DestLeft, bm.DestTop, bm.DestRight, bm.DestBottom),
-			"bm_wh", fmt.Sprintf("%dx%d bpp=%d", bm.Width, bm.Height, bm.BitsPerPixel),
-			"visible_x0y0x1y1", fmt.Sprintf("%d,%d,%d,%d", x0, y0, x1, y1),
-			"srcCol_srcRow", fmt.Sprintf("%d,%d", srcCol, srcRow),
-			"data_len", len(bm.Data),
-		)
 		srcOff := srcRow*bm.Width*4 + srcCol*4
 		rect := sdl.Rect{X: int32(x0), Y: int32(y0), W: int32(x1 - x0), H: int32(y1 - y0)}
 		texture.Update(&rect, unsafe.Pointer(&bm.Data[srcOff]), bm.Width*4)
 		*dirtyRects = append(*dirtyRects, rect)
 	}
+}
+
+// isInvalidChromaNV12 checks if an NV12 frame has corrupted/zero chroma.
+// In valid YCbCr, neutral/grayscale chroma is ~128. Values near 0 (U<30 && V<30)
+// indicate uninitialized/corrupt buffers that render as bright green ("green curtain").
+func isInvalidChromaNV12(uv []byte, uvStride, w, h int) bool {
+	if len(uv) == 0 || w <= 0 || h <= 0 {
+		return true
+	}
+	ph := (h + 1) / 2
+	pw := (w + 1) / 2
+	xs := [3]int{pw / 4, pw / 2, 3 * pw / 4}
+	ys := [3]int{ph / 4, ph / 2, 3 * ph / 4}
+	zeroCount := 0
+	for _, y := range ys {
+		rowOff := y * uvStride
+		for _, x := range xs {
+			off := rowOff + x*2
+			if off+1 < len(uv) {
+				u := uv[off]
+				v := uv[off+1]
+				if u < 30 && v < 30 {
+					zeroCount++
+				}
+			}
+		}
+	}
+	return zeroCount >= 3
+}
+
+// isInvalidChromaI420 checks if an I420 frame has corrupted/zero chroma.
+func isInvalidChromaI420(u, v []byte, uStride, vStride, w, h int) bool {
+	if len(u) == 0 || len(v) == 0 || w <= 0 || h <= 0 {
+		return true
+	}
+	ph := (h + 1) / 2
+	pw := (w + 1) / 2
+	xs := [3]int{pw / 4, pw / 2, 3 * pw / 4}
+	ys := [3]int{ph / 4, ph / 2, 3 * ph / 4}
+	zeroCount := 0
+	for _, y := range ys {
+		uOff := y * uStride
+		vOff := y * vStride
+		for _, x := range xs {
+			if uOff+x < len(u) && vOff+x < len(v) {
+				uVal := u[uOff+x]
+				vVal := v[vOff+x]
+				if uVal < 30 && vVal < 30 {
+					zeroCount++
+				}
+			}
+		}
+	}
+	return zeroCount >= 3
 }
 
 // uploadYUVFrame uploads a decoded H.264 YUV frame into the SDL2 YUV texture.
@@ -452,8 +520,8 @@ func mainLoop(hostPort, domain, user, password string, width, height int, swapAl
 	// Initialise texture to transparent now so blending is correct from the first frame.
 	texture.Update(nil, unsafe.Pointer(&overlayZero[0]), width*4)
 
-	bitmapCh := make(chan []grdp.Bitmap, 32)
-	yuvCh := make(chan yuvFrame, 4)
+	bitmapCh := make(chan []grdp.Bitmap, 64)
+	yuvCh := make(chan yuvFrame, 32)
 	yuvReady := false // true once any H264 frame has been rendered
 	clipboardFromServer := make(chan string, 4)
 	clipboardReqCh := make(chan chan string, 1)
@@ -713,6 +781,11 @@ func mainLoop(hostPort, domain, user, password string, width, height int, swapAl
 				everShowedFrame.Store(true)
 				lastServerActivity.Store(time.Now().UnixNano())
 
+				if isInvalidChromaNV12(uv, uvStride, w, h) {
+					slog.Debug("dropping invalid chroma NV12 frame (green guard)")
+					return
+				}
+
 				ph := (h + 1) / 2
 				yLen := yStride * h
 				uvLen := uvStride * ph
@@ -737,9 +810,16 @@ func mainLoop(hostPort, domain, user, password string, width, height int, swapAl
 				select {
 				case yuvCh <- frame:
 				default:
-					yuvBufPool.Put(buf)
-					slog.Warn("yuv channel full, dropping NV12 frame")
-					lastH264DropNs.Store(time.Now().UnixNano())
+					select {
+					case old := <-yuvCh:
+						yuvBufPool.Put(old.buf)
+					default:
+					}
+					select {
+					case yuvCh <- frame:
+					default:
+						yuvBufPool.Put(buf)
+					}
 				}
 				if bitmapEventType != sdl.FIRSTEVENT && eventPending.CompareAndSwap(false, true) {
 					sdl.PushEvent(wakeEvent)
@@ -749,6 +829,11 @@ func mainLoop(hostPort, domain, user, password string, width, height int, swapAl
 			rdpClient.OnH264I420(func(destX, destY, w, h int, y []byte, yStride int, u []byte, uStride int, v []byte, vStride int) {
 				everShowedFrame.Store(true)
 				lastServerActivity.Store(time.Now().UnixNano())
+
+				if isInvalidChromaI420(u, v, uStride, vStride, w, h) {
+					slog.Debug("dropping invalid chroma I420 frame (green guard)")
+					return
+				}
 
 				ph := (h + 1) / 2
 				yLen := yStride * h
@@ -778,9 +863,16 @@ func mainLoop(hostPort, domain, user, password string, width, height int, swapAl
 				select {
 				case yuvCh <- frame:
 				default:
-					yuvBufPool.Put(buf)
-					slog.Warn("yuv channel full, dropping I420 frame")
-					lastH264DropNs.Store(time.Now().UnixNano())
+					select {
+					case old := <-yuvCh:
+						yuvBufPool.Put(old.buf)
+					default:
+					}
+					select {
+					case yuvCh <- frame:
+					default:
+						yuvBufPool.Put(buf)
+					}
 				}
 				if bitmapEventType != sdl.FIRSTEVENT && eventPending.CompareAndSwap(false, true) {
 					sdl.PushEvent(wakeEvent)
@@ -817,16 +909,6 @@ func mainLoop(hostPort, domain, user, password string, width, height int, swapAl
 	// reconnect fires.
 	const neverShownKeyframeGrace = 2500 * time.Millisecond
 	const neverShownKeyframeInterval = 2 * time.Second
-
-	// swFallbackBGRATimeout is the maximum duration we allow the session to
-	// render via full-screen BGRA bitmap patches without any YUV frames.
-	// When the H.264 hardware decoder stalls, grdp falls back to software
-	// decoding; the SW decoder is primed with a stale cached IDR and often
-	// produces block-noise/mosaic frames that never resync.  A reconnect
-	// recreates the hardware decoder and usually clears the corruption.
-	// This watchdog only arms after at least one YUV frame has been seen,
-	// so BGRA-only sessions are not affected.
-	const swFallbackBGRATimeout = 5 * time.Second
 
 	// renderDirty counts down from 3 to 0.  It is set to 3 whenever new content
 	// arrives (YUV frame, bitmap patch, or reconnect).  The render trio
@@ -905,11 +987,15 @@ func mainLoop(hostPort, domain, user, password string, width, height int, swapAl
 				quit = true
 
 			case *sdl.WindowEvent:
-				if t.Event == sdl.WINDOWEVENT_RESIZED {
-					resizeW = t.Data1
-					resizeH = t.Data2
-					resizePending = true
-					resizeTime = time.Now()
+				if t.Event == sdl.WINDOWEVENT_RESIZED || t.Event == sdl.WINDOWEVENT_SIZE_CHANGED {
+					dw := abs(int(t.Data1) - width)
+					dh := abs(int(t.Data2) - height)
+					if dw > 2 || dh > 2 {
+						resizeW = t.Data1
+						resizeH = t.Data2
+						resizePending = true
+						resizeTime = time.Now()
+					}
 				}
 
 			case *sdl.KeyboardEvent:
@@ -1109,14 +1195,18 @@ func mainLoop(hostPort, domain, user, password string, width, height int, swapAl
 
 		if resizePending && now.Sub(resizeTime) > 500*time.Millisecond {
 			resizePending = false
-			slog.Info("Window resized, reconnecting", "width", resizeW, "height", resizeH)
-			reconnecting.Store(1)
-			reconnErr := rdpClient.Reconnect(int(resizeW), int(resizeH))
-			reconnecting.Store(0)
-			if reconnErr != nil {
-				slog.Error("Reconnect failed", "err", reconnErr)
-			} else {
-				resetAfterReconnect(resizeW, resizeH)
+			dw := abs(int(resizeW) - width)
+			dh := abs(int(resizeH) - height)
+			if dw > 2 || dh > 2 {
+				slog.Info("Window resized, reconnecting", "width", resizeW, "height", resizeH, "oldWidth", width, "oldHeight", height)
+				reconnecting.Store(1)
+				reconnErr := rdpClient.Reconnect(int(resizeW), int(resizeH))
+				reconnecting.Store(0)
+				if reconnErr != nil {
+					slog.Error("Reconnect failed", "err", reconnErr)
+				} else {
+					resetAfterReconnect(resizeW, resizeH)
+				}
 			}
 		}
 
@@ -1219,38 +1309,6 @@ func mainLoop(hostPort, domain, user, password string, width, height int, swapAl
 				} else {
 					slog.Warn("Video stalled", "stalled", elapsed.Round(time.Millisecond))
 					lastServerActivity.Store(nowNs) // reset to avoid repeated log spam
-				}
-			}
-		}
-
-		// SW fallback BGRA watchdog: when the hardware decoder stalls, grdp
-		// falls back to software decoding and the server sends full-screen BGRA
-		// bitmap patches.  The SW decoder is primed with a stale cached IDR and
-		// often produces persistent block-noise/mosaic frames that never resync
-		// on their own.  If full-screen BGRA patches keep arriving but no YUV
-		// frame has been processed for swFallbackBGRATimeout, reconnect to
-		// recreate the hardware decoder.  The watchdog only arms after at least
-		// one YUV frame has been seen, so BGRA-only sessions are unaffected.
-		if !resizePending && reconnecting.Load() == 0 {
-			startNs := fullScreenBitmapStartTime.Load()
-			lastFSNs := lastFullScreenBitmapTime.Load()
-			lastYUVNs := lastYUVFrameTime.Load()
-			if startNs != 0 && lastFSNs != 0 && lastYUVNs != 0 {
-				yuvIdle := nowNs - lastYUVNs
-				fsRecent := nowNs - lastFSNs
-				if yuvIdle > int64(swFallbackBGRATimeout) && fsRecent < int64(time.Second) {
-					w, h := window.GetSize()
-					slog.Warn("SW fallback BGRA persisted, reconnecting to recover HW decoder",
-						"yuvIdle", time.Duration(yuvIdle).Round(time.Millisecond),
-						"width", w, "height", h)
-					reconnecting.Store(1)
-					reconnErr := rdpClient.Reconnect(int(w), int(h))
-					reconnecting.Store(0)
-					if reconnErr != nil {
-						slog.Error("Reconnect (SW fallback BGRA) failed", "err", reconnErr)
-					} else {
-						resetAfterReconnect(w, h)
-					}
 				}
 			}
 		}
