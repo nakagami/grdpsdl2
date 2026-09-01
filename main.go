@@ -1177,10 +1177,12 @@ func mainLoop(hostPort, domain, user, password string, width, height int, swapAl
 		// buffering requires re-issuing the same draw commands until all buffers
 		// are updated, otherwise a stale empty backbuffer flashes through).
 		if renderDirty > 0 {
-			// Skip Clear when the YUV texture provides a full-screen base layer:
-			// renderer.Copy(yuvTexture, nil, nil) fills every pixel, making the
-			// prior Clear a wasted GPU command.  Clear is still needed for
-			// bitmap-only sessions.
+			// In H.264 sessions, keep the display black until the first video
+			// frame arrives (or the warm-up grace elapses) so that intermediate
+			// warm-up bitmap patches do not flicker on screen before the real
+			// desktop baseline is ready.
+			canShowContent := yuvReady || yuvTexture == nil || time.Duration(nowNs-neverShownConnectNs) >= neverShownKeyframeGrace
+
 			if !yuvReady {
 				renderer.SetDrawColor(0, 0, 0, 255)
 				renderer.Clear()
@@ -1188,12 +1190,9 @@ func mainLoop(hostPort, domain, user, password string, width, height int, swapAl
 			if yuvReady {
 				renderer.Copy(yuvTexture, nil, nil)
 			}
-			// Skip the overlay copy when the texture is fully transparent —
-			// overlayHasContent tracks whether any bitmap patch has been painted
-			// since the last full-texture clear (Tier-1 clearOverlayDirty or
-			// reconnect).  In bitmap-only sessions (!yuvReady) we always copy
-			// because the overlay holds all visible content.
-			if overlayHasContent || !yuvReady {
+			// Skip the overlay copy when the texture is fully transparent or when
+			// content is held back during the initial connection warm-up.
+			if canShowContent && (overlayHasContent || !yuvReady) {
 				renderer.Copy(texture, nil, nil)
 			}
 			renderer.Present()
