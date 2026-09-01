@@ -481,44 +481,13 @@ func mainLoop(hostPort, domain, user, password string, width, height int, swapAl
 	// clearOverlayDirty empties overlayDirtyRects.
 	overlayHasContent := false
 
-	// clearOverlayDirty clears the overlay texture regions accumulated in
-	// overlayDirtyRects and resets the slice.
-	//
-	// Three tiers:
-	//   1. Total dirty area > half screen → one full-texture SDL_UpdateTexture (1 cgo).
-	//   2. Multiple dirty rects            → lock bounding rect once, zero each dirty
-	//                                        region in Go, unlock (2 cgo calls instead
-	//                                        of N SDL_UpdateTexture calls).
-	//   3. Single dirty rect               → one SDL_UpdateTexture (1 cgo, minimal GPU
-	//                                        upload; Lock would cost the same).
+	// clearOverlayDirty clears the entire overlay texture to transparent and resets state.
 	clearOverlayDirty := func() {
-		if len(overlayDirtyRects) == 0 {
+		if !overlayHasContent && len(overlayDirtyRects) == 0 {
 			return
 		}
-		var dirtyArea int
-		for _, r := range overlayDirtyRects {
-			dirtyArea += int(r.W) * int(r.H)
-		}
-		if dirtyArea*2 > width*height {
-			// Tier 1: one GPU upload clears the entire overlay texture.
-			texture.Update(nil, unsafe.Pointer(&overlayZero[0]), width*4)
-			overlayHasContent = false // entire texture is now transparent
-		} else if len(overlayDirtyRects) > 1 {
-			// Tier 2: multiple dirty rects — one SDL_UpdateTexture per rect.
-			// Note: texture.Lock with a subrect returns a slice whose capacity
-			// is computed using the texture query width, not the actual pitch.
-			// If the SDL renderer pads rows (e.g. Metal alignment), the pitch
-			// offset arithmetic can exceed the slice bounds.  Using
-			// SDL_UpdateTexture avoids that hazard at the cost of extra CGo
-			// calls, which is acceptable since Tier 1 already handles the
-			// hot path (large dirty area).
-			for i := range overlayDirtyRects {
-				texture.Update(&overlayDirtyRects[i], unsafe.Pointer(&overlayZero[0]), width*4)
-			}
-		} else {
-			// Tier 3: single dirty rect — one SDL_UpdateTexture is optimal.
-			texture.Update(&overlayDirtyRects[0], unsafe.Pointer(&overlayZero[0]), width*4)
-		}
+		texture.Update(nil, unsafe.Pointer(&overlayZero[0]), width*4)
+		overlayHasContent = false
 		overlayDirtyRects = overlayDirtyRects[:0]
 	}
 
@@ -1025,9 +994,17 @@ func mainLoop(hostPort, domain, user, password string, width, height int, swapAl
 				}
 			}
 			if haveYUV {
-				clearOverlayDirty()
-				rect := sdl.Rect{X: int32(latestYUV.destX), Y: int32(latestYUV.destY), W: int32(latestYUV.w), H: int32(latestYUV.h)}
-				uploadYUVFrame(latestYUV, yuvTexture, &rect)
+				isFullScreen := latestYUV.destX == 0 && latestYUV.destY == 0 &&
+					latestYUV.w >= width && latestYUV.h >= height
+				if isFullScreen {
+					clearOverlayDirty()
+				}
+				rectW := min(latestYUV.w, width-latestYUV.destX)
+				rectH := min(latestYUV.h, height-latestYUV.destY)
+				if rectW > 0 && rectH > 0 {
+					rect := sdl.Rect{X: int32(latestYUV.destX), Y: int32(latestYUV.destY), W: int32(rectW), H: int32(rectH)}
+					uploadYUVFrame(latestYUV, yuvTexture, &rect)
+				}
 				yuvBufPool.Put(latestYUV.buf)
 				yuvReady = true
 				lastYUVFrameTime.Store(nowNs)
