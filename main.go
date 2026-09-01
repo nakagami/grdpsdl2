@@ -374,109 +374,6 @@ type yuvFrame struct {
 	uv                 []byte
 	uvStride           int
 	buf                []byte
-	isNull             bool // true when the decoded frame is all-zero (VideoToolbox flush/init artifact)
-}
-
-// yuvStage describes the SDL2 YUV texture's pre-locked staging buffer.
-// The main goroutine locks the full texture once and publishes the resulting
-// yuvStage to H.264 callbacks via yuvStageCh, so callbacks can write decoded
-// frames directly into the GPU-accessible unified-memory buffer.
-// This halves per-frame data movement: one copy (grdp → MTLBuffer) instead of
-// two (grdp → pool → MTLBuffer).
-type yuvStage struct {
-	all    []byte // entire locked buffer: Y plane then UV/U/V planes
-	pitch  int    // row pitch (bytes) in the locked buffer
-	tw, th int    // full texture dimensions (not the frame sub-rect)
-}
-
-// yuvDone is sent from the H.264 callback goroutine to the main goroutine once
-// the decoded frame has been written into the pre-locked yuvStage, signalling
-// that Unlock (and the resulting Metal command-buffer commit) is safe to call.
-type yuvDone struct {
-	destX, destY, w, h int
-	isNull             bool // true when the decoded frame is all-zero (VideoToolbox flush/init artifact)
-	fullTexture        bool // true when the frame covered the full texture; UV is fully written — skip chroma init on next lock
-}
-
-// isNullYUVFrame returns true when a decoded YUV frame looks like a null or
-// corrupt decoder output that should not be rendered.
-//
-// Two patterns are detected:
-//
-//  1. All sampled Y, U and V values are exactly zero.  In limited-range YUV
-//     a legitimate black frame has Y≥16 and chroma=128, so Y=0 across the
-//     frame is a reliable marker for a null frame.
-//
-//  2. Both chroma planes are abnormally low (< lowChromaThreshold).  Valid
-//     desktop content keeps chroma centred near 128; both planes collapsing
-//     to ~0 is the green-monochrome corruption produced by stale IDR priming
-//     or an uninitialised decoder buffer.  The threshold matches grdp's SW
-//     fallback detector (72) so main.go catches any corrupt frames that slip
-//     through the decoder-side checks.
-//
-// For NV12 u and v point to the same interleaved UV plane; for I420 they
-// point to separate U and V planes.
-func isNullYUVFrame(y, u, v []byte) bool {
-	if len(y) == 0 || len(u) == 0 {
-		return false
-	}
-
-	const lowChromaThreshold = 72
-
-	// Sample 8 evenly-spaced values from each plane.
-	yStep := max(1, len(y)/8)
-	uStep := max(1, len(u)/8)
-	vStep := max(1, len(v)/8)
-
-	// Pattern 1: all-zero Y and chroma.
-	allYZero := true
-	for i := 0; i < len(y); i += yStep {
-		if y[i] != 0 {
-			allYZero = false
-			break
-		}
-	}
-	allUZero := true
-	for i := 0; i < len(u); i += uStep {
-		if u[i] != 0 {
-			allUZero = false
-			break
-		}
-	}
-	allVZero := true
-	if len(v) > 0 {
-		for i := 0; i < len(v); i += vStep {
-			if v[i] != 0 {
-				allVZero = false
-				break
-			}
-		}
-	} else {
-		allVZero = allUZero
-	}
-	if allYZero && allUZero && allVZero {
-		return true
-	}
-
-	// Pattern 2: near-zero chroma across the whole frame (green-monochrome
-	// corruption).  Skip when luma is also all-zero; that is either a genuine
-	// black frame or a warm-up frame handled by the decoder.
-	if allYZero {
-		return false
-	}
-	for i := 0; i < len(u); i += uStep {
-		if u[i] >= lowChromaThreshold {
-			return false
-		}
-	}
-	if len(v) > 0 {
-		for i := 0; i < len(v); i += vStep {
-			if v[i] >= lowChromaThreshold {
-				return false
-			}
-		}
-	}
-	return true
 }
 
 func mainLoop(hostPort, domain, user, password string, width, height int, swapAltMeta bool, keyboardType, keyboardLayout string, disableAVC444 bool) (err error) {
@@ -643,104 +540,16 @@ func mainLoop(hostPort, domain, user, password string, width, height int, swapAl
 	texture.Update(nil, unsafe.Pointer(&overlayZero[0]), width*4)
 
 	bitmapCh := make(chan []grdp.Bitmap, 32)
-	yuvCh := make(chan yuvFrame, 4) // fallback path only (used when pre-lock unavailable)
-	yuvReady := false               // true once any H264 frame has been rendered
-	yuvTextureIsNull := false       // true when the last uploaded frame was null (Y=0,UV=0=green); skip Copy
+	yuvCh := make(chan yuvFrame, 4)
+	yuvReady := false // true once any H264 frame has been rendered
 	clipboardFromServer := make(chan string, 4)
 	clipboardReqCh := make(chan chan string, 1)
-
-	// Pre-lock channels for the primary YUV upload path.
-	// yuvStageCh carries the pre-locked staging buffer from the main goroutine
-	// to H.264 callbacks; yuvDoneCh signals back when a frame has been written.
-	// Capacity 1 each: at most one frame is in flight at any time.
-	// yuvStage is passed by value so the channel stores the struct inline,
-	// avoiding a heap allocation on every frame.
-	yuvStageCh := make(chan yuvStage, 1)
-	yuvDoneCh := make(chan yuvDone, 1)
-	var yuvWriteWg sync.WaitGroup // counts H.264 writes currently in progress
 
 	// lastH264DropNs records the Unix nanosecond timestamp of the most recent
 	// dropped H.264 frame (0 = no recent drop).  Used to set the queueDepth
 	// hint that tells the RDP server to reduce H.264 bitrate when SDL's
 	// rendering pipeline is congested.
 	var lastH264DropNs atomic.Int64
-
-	// preLockYUV locks the full YUV streaming texture and returns a yuvStage
-	// that H.264 callbacks can write directly into.  Must be called from the
-	// main (SDL) goroutine.  Returns nil if Lock fails (e.g. software renderer).
-	// initChroma should be true so that unwritten chroma regions render black
-	// (neutral 128) instead of green (Y=0,UV=0 is not a valid black in BT.601).
-	// Metal's staging MTLBuffer pool may return a freshly zeroed buffer on each
-	// lock, so we cannot rely on previous-frame data in unwritten UV regions.
-	preLockYUV := func(tex *sdl.Texture, tw, th int, format uint32, initChroma bool) (yuvStage, bool) {
-		pixels, pitch, err := tex.Lock(nil)
-		if err != nil {
-			return yuvStage{}, false
-		}
-		ph := (th + 1) / 2
-		yLen := pitch * th
-		var all []byte
-		if format == sdlPixelFormatNV12 {
-			all = unsafe.Slice(&pixels[0], yLen+pitch*ph)
-		} else {
-			uPitch := (pitch + 1) / 2
-			all = unsafe.Slice(&pixels[0], yLen+2*uPitch*ph)
-		}
-		if initChroma {
-			fillBytes(all[yLen:], 128)
-		}
-		return yuvStage{all: all, pitch: pitch, tw: tw, th: th}, true
-	}
-
-	// drainPreLock ensures yuvTexture is unlocked before destroying or
-	// recreating it.  Waits for any in-progress callback write to finish,
-	// then unlocks if the texture is currently held by the pre-lock path.
-	// Must be called from the main goroutine.
-	//
-	// Order matters: drain yuvStageCh FIRST so that any new callbacks
-	// arriving after the drain find the channel empty and take the default
-	// (drop) branch — they never receive a stage and therefore never spawn
-	// write goroutines.  Only after the channel is empty do we call Wait()
-	// to join any goroutines that were already mid-write.  Calling Wait()
-	// first and draining second leaves a window where a callback calls
-	// Add(1) after Wait() returns (counter was 0), then receives the
-	// stage before we drain it, spawns goroutines, and those goroutines
-	// race with the imminent texture destroy.
-	drainPreLock := func() {
-		// Remove the pre-locked stage so no new callback can start a write.
-		select {
-		case <-yuvStageCh:
-			// Stage was sitting in the channel (callback never consumed it).
-			// Unlock is deferred to after Wait() so the sequence is:
-			// drain → wait → unlock, preventing a double-unlock if a
-			// callback is already mid-write with this stage.
-			defer yuvTexture.Unlock()
-		default:
-		}
-		// Wait for any callback that already received the stage (and called
-		// Add) to finish writing and call Done.
-		yuvWriteWg.Wait()
-		// If a callback consumed the stage and sent a done notification,
-		// the main loop (now exiting or reconnecting) hasn't consumed it yet
-		// — do the deferred Unlock here.
-		select {
-		case <-yuvDoneCh:
-			yuvTexture.Unlock() // callback wrote a frame; its Unlock was deferred to us
-		default:
-			// texture is not currently locked; nothing to do
-		}
-	}
-
-	// yuvPrimaryPath is true when the pre-lock optimisation is active.
-	// It is set to false when Lock fails (e.g. software renderer) so
-	// the code automatically degrades to the pool-buffer fallback path.
-	yuvPrimaryPath := false
-	if yuvTexture != nil {
-		if stage, ok := preLockYUV(yuvTexture, width, height, yuvTextureFormat, true); ok {
-			yuvPrimaryPath = true
-			yuvStageCh <- stage
-		}
-	}
 
 	// overlayDirtyRects accumulates the rects painted onto the overlay texture
 	// (non-H264 bitmap updates) since the last H264 frame.  When the next H264
@@ -1019,126 +828,36 @@ func mainLoop(hostPort, domain, user, password string, width, height int, swapAl
 	if yuvTexture != nil {
 		if yuvTextureFormat == sdlPixelFormatNV12 {
 			rdpClient.OnH264NV12(func(destX, destY, w, h int, y []byte, yStride int, uv []byte, uvStride int) {
-				if yuvPrimaryPath {
-					// Primary path: write grdp data directly into the pre-locked
-					// Metal staging buffer (one copy: grdp → MTLBuffer).
-					//
-					// Add to WaitGroup BEFORE the select so drainPreLock's Wait()
-					// cannot return between the stage receive and the first write,
-					// eliminating a narrow use-after-free window during reconnect.
-					yuvWriteWg.Add(1)
-					select {
-					case stage := <-yuvStageCh:
-						defer yuvWriteWg.Done()
-						// UV plane starts after ALL Y rows of the full texture,
-						// not just the frame rows.  Using stage.th (texture height)
-						// instead of h fixes corruption when the frame is smaller
-						// than the texture (e.g. a video window inside the desktop).
-						yBaseLen := stage.pitch * stage.th
-						fastPath := stage.pitch == yStride && destX == 0 && destY == 0
-						// fullTexture: the frame covers the entire texture, so every
-						// Y and UV byte will be overwritten — the next lock can skip
-						// the UV pre-initialisation (saves ~1 MB memset per frame).
-						fullTexture := fastPath && h == stage.th
-						isNull := isNullYUVFrame(y, uv, uv)
-						if isNull {
-							slog.Debug("YUV: holding previous frame (null/corrupt NV12 detected)")
-						} else {
-							everShowedFrame.Store(true)
-							lastServerActivity.Store(time.Now().UnixNano())
-						}
-						// Clip copy height to texture dimensions: H.264 aligns frame
-						// height to 16-pixel multiples (e.g. 1072 for a 1060-row
-						// display), so h may exceed stage.th.  Copying the extra rows
-						// would: (a) overflow the staging buffer (UV starts at
-						// stage.th, so Y rows beyond stage.th land in the UV region),
-						// and (b) in the parallel fast path, cause a data race between
-						// the Y and UV goroutines writing to the same buffer region
-						// [stage.th*pitch, h*pitch).
-						copyH := min(h, stage.th)
-						copyPh := (copyH + 1) / 2
-						if isNull {
-							// Fill UV with 128 (neutral chroma) so Unlock commits black
-							// instead of green.  Metal staging buffers may be freshly
-							// zeroed (UV=0); Y=0,UV=0 renders as green in BT.601.
-							fillBytes(stage.all[yBaseLen:], 128)
-						} else if fastPath {
-							yLen := stage.pitch * copyH
-							copyUVLen := stage.pitch * copyPh
-							total := yLen + copyUVLen
-							if total >= 256*256*4 {
-								var wg sync.WaitGroup
-								wg.Add(2)
-								go func() { defer wg.Done(); copy(stage.all[:yLen], y[:yLen]) }()
-								go func() {
-									defer wg.Done()
-									copy(stage.all[yBaseLen:yBaseLen+copyUVLen], uv[:copyUVLen])
-								}()
-								wg.Wait()
-							} else {
-								copy(stage.all[:yLen], y[:yLen])
-								copy(stage.all[yBaseLen:yBaseLen+copyUVLen], uv[:copyUVLen])
-							}
-						} else {
-							for row := range copyH {
-								dstOff := (destY+row)*stage.pitch + destX
-								copy(stage.all[dstOff:dstOff+w], y[row*yStride:row*yStride+w])
-							}
-							for row := range copyPh {
-								dstOff := yBaseLen + (destY/2+row)*stage.pitch + destX
-								copy(stage.all[dstOff:dstOff+w], uv[row*uvStride:row*uvStride+w])
-							}
-						}
-						done := yuvDone{destX: destX, destY: destY, w: w, h: h,
-							isNull: isNull, fullTexture: fullTexture && !isNull}
-						select {
-						case yuvDoneCh <- done:
-						default:
-							// Replace stale entry so the main loop always sees the latest frame.
-							<-yuvDoneCh
-							yuvDoneCh <- done
-						}
-					default:
-						yuvWriteWg.Done()
-						slog.Debug("yuv stage not ready, dropping NV12 frame")
-						lastH264DropNs.Store(time.Now().UnixNano())
-					}
+				everShowedFrame.Store(true)
+				lastServerActivity.Store(time.Now().UnixNano())
+
+				ph := (h + 1) / 2
+				yLen := yStride * h
+				uvLen := uvStride * ph
+				totalLen := yLen + uvLen
+				buf, _ := yuvBufPool.Get().([]byte)
+				if cap(buf) < totalLen {
+					buf = make([]byte, totalLen)
 				} else {
-					// Fallback path (pre-lock unavailable): copy into pool buffer.
-					ph := (h + 1) / 2
-					yLen := yStride * h
-					uvLen := uvStride * ph
-					totalLen := yLen + uvLen
-					buf, _ := yuvBufPool.Get().([]byte)
-					if cap(buf) < totalLen {
-						buf = make([]byte, totalLen)
-					} else {
-						buf = buf[:totalLen]
-					}
-					copy(buf[:yLen], y[:yLen])
-					copy(buf[yLen:yLen+uvLen], uv[:uvLen])
-					isNull := isNullYUVFrame(buf[:yLen], buf[yLen:yLen+uvLen], buf[yLen:yLen+uvLen])
-					if isNull {
-						slog.Debug("YUV: holding previous frame (null/corrupt NV12 detected)")
-					} else {
-						everShowedFrame.Store(true)
-						lastServerActivity.Store(time.Now().UnixNano())
-					}
-					frame := yuvFrame{
-						destX: destX, destY: destY, w: w, h: h,
-						format: yuvTextureFormat,
-						y:      buf[:yLen], yStride: yStride,
-						uv: buf[yLen : yLen+uvLen], uvStride: uvStride,
-						buf:    buf,
-						isNull: isNull,
-					}
-					select {
-					case yuvCh <- frame:
-					default:
-						yuvBufPool.Put(buf)
-						slog.Warn("yuv channel full, dropping NV12 frame")
-						lastH264DropNs.Store(time.Now().UnixNano())
-					}
+					buf = buf[:totalLen]
+				}
+				copy(buf[:yLen], y[:yLen])
+				copy(buf[yLen:yLen+uvLen], uv[:uvLen])
+				frame := yuvFrame{
+					destX: destX, destY: destY, w: w, h: h,
+					format:   yuvTextureFormat,
+					y:        buf[:yLen],
+					yStride:  yStride,
+					uv:       buf[yLen : yLen+uvLen],
+					uvStride: uvStride,
+					buf:      buf,
+				}
+				select {
+				case yuvCh <- frame:
+				default:
+					yuvBufPool.Put(buf)
+					slog.Warn("yuv channel full, dropping NV12 frame")
+					lastH264DropNs.Store(time.Now().UnixNano())
 				}
 				if bitmapEventType != sdl.FIRSTEVENT && eventPending.CompareAndSwap(false, true) {
 					sdl.PushEvent(wakeEvent)
@@ -1146,129 +865,40 @@ func mainLoop(hostPort, domain, user, password string, width, height int, swapAl
 			})
 		} else {
 			rdpClient.OnH264I420(func(destX, destY, w, h int, y []byte, yStride int, u []byte, uStride int, v []byte, vStride int) {
-				if yuvPrimaryPath {
-					// Add to WaitGroup BEFORE the select (same rationale as NV12 path).
-					yuvWriteWg.Add(1)
-					select {
-					case stage := <-yuvStageCh:
-						defer yuvWriteWg.Done()
-						ph := (h + 1) / 2
-						// UV planes start after ALL Y rows of the full texture.
-						// Using stage.th (texture height) instead of h fixes
-						// corruption when the frame is smaller than the texture.
-						yBaseLen := stage.pitch * stage.th
-						uPitch := (stage.pitch + 1) / 2
-						phTex := (stage.th + 1) / 2
-						uBaseLen := yBaseLen + uPitch*phTex
-						vBaseLen := uBaseLen + uPitch*phTex
-						fastPath := stage.pitch == yStride && uPitch == uStride && destX == 0 && destY == 0
-						fullTexture := fastPath && h == stage.th
-						isNull := isNullYUVFrame(y, u, v)
-						if isNull {
-							slog.Debug("YUV: holding previous frame (null/corrupt I420 detected)")
-						} else {
-							everShowedFrame.Store(true)
-							lastServerActivity.Store(time.Now().UnixNano())
-						}
-						// Clip copy height to texture dimensions (same rationale as NV12
-						// path: H.264 frame height rounds up to 16-pixel multiples, so h
-						// may exceed stage.th, causing buffer overflow and, in the parallel
-						// fast path, a data race between Y and UV goroutines).
-						copyH := min(h, stage.th)
-						copyPh := min(ph, phTex)
-						if isNull {
-							// Fill U and V planes with 128 so Unlock commits black
-							// instead of green.  Metal staging buffers may be freshly
-							// zeroed (UV=0); Y=0,UV=0 renders as green in BT.601.
-							fillBytes(stage.all[uBaseLen:], 128)
-						} else if fastPath {
-							yLen := stage.pitch * copyH
-							copyUVLen := uPitch * copyPh
-							total := yLen + copyUVLen*2
-							if total >= 256*256*4 {
-								var wg sync.WaitGroup
-								wg.Add(3)
-								go func() { defer wg.Done(); copy(stage.all[:yLen], y[:yLen]) }()
-								go func() {
-									defer wg.Done()
-									copy(stage.all[uBaseLen:uBaseLen+copyUVLen], u[:copyUVLen])
-								}()
-								go func() {
-									defer wg.Done()
-									copy(stage.all[vBaseLen:vBaseLen+copyUVLen], v[:copyUVLen])
-								}()
-								wg.Wait()
-							} else {
-								copy(stage.all[:yLen], y[:yLen])
-								copy(stage.all[uBaseLen:uBaseLen+copyUVLen], u[:copyUVLen])
-								copy(stage.all[vBaseLen:vBaseLen+copyUVLen], v[:copyUVLen])
-							}
-						} else {
-							w2 := (w + 1) / 2
-							for row := range copyH {
-								dstOff := (destY+row)*stage.pitch + destX
-								copy(stage.all[dstOff:dstOff+w], y[row*yStride:row*yStride+w])
-							}
-							for row := range copyPh {
-								dstOff := uBaseLen + (destY/2+row)*uPitch + destX/2
-								copy(stage.all[dstOff:dstOff+w2], u[row*uStride:row*uStride+w2])
-							}
-							for row := range copyPh {
-								dstOff := vBaseLen + (destY/2+row)*uPitch + destX/2
-								copy(stage.all[dstOff:dstOff+w2], v[row*vStride:row*vStride+w2])
-							}
-						}
-						done := yuvDone{destX: destX, destY: destY, w: w, h: h,
-							isNull: isNull, fullTexture: fullTexture && !isNull}
-						select {
-						case yuvDoneCh <- done:
-						default:
-							<-yuvDoneCh
-							yuvDoneCh <- done
-						}
-					default:
-						yuvWriteWg.Done()
-						slog.Debug("yuv stage not ready, dropping I420 frame")
-						lastH264DropNs.Store(time.Now().UnixNano())
-					}
+				everShowedFrame.Store(true)
+				lastServerActivity.Store(time.Now().UnixNano())
+
+				ph := (h + 1) / 2
+				yLen := yStride * h
+				uLen := uStride * ph
+				vLen := vStride * ph
+				totalLen := yLen + uLen + vLen
+				buf, _ := yuvBufPool.Get().([]byte)
+				if cap(buf) < totalLen {
+					buf = make([]byte, totalLen)
 				} else {
-					ph := (h + 1) / 2
-					yLen := yStride * h
-					uLen := uStride * ph
-					vLen := vStride * ph
-					totalLen := yLen + uLen + vLen
-					buf, _ := yuvBufPool.Get().([]byte)
-					if cap(buf) < totalLen {
-						buf = make([]byte, totalLen)
-					} else {
-						buf = buf[:totalLen]
-					}
-					copy(buf[:yLen], y[:yLen])
-					copy(buf[yLen:yLen+uLen], u[:uLen])
-					copy(buf[yLen+uLen:yLen+uLen+vLen], v[:vLen])
-					isNull := isNullYUVFrame(buf[:yLen], buf[yLen:yLen+uLen], buf[yLen+uLen:yLen+uLen+vLen])
-					if isNull {
-						slog.Debug("YUV: holding previous frame (null/corrupt I420 detected)")
-					} else {
-						everShowedFrame.Store(true)
-						lastServerActivity.Store(time.Now().UnixNano())
-					}
-					frame := yuvFrame{
-						destX: destX, destY: destY, w: w, h: h,
-						format: yuvTextureFormat,
-						y:      buf[:yLen], yStride: yStride,
-						u: buf[yLen : yLen+uLen], uStride: uStride,
-						v: buf[yLen+uLen : yLen+uLen+vLen], vStride: vStride,
-						buf:    buf,
-						isNull: isNull,
-					}
-					select {
-					case yuvCh <- frame:
-					default:
-						yuvBufPool.Put(buf)
-						slog.Warn("yuv channel full, dropping I420 frame")
-						lastH264DropNs.Store(time.Now().UnixNano())
-					}
+					buf = buf[:totalLen]
+				}
+				copy(buf[:yLen], y[:yLen])
+				copy(buf[yLen:yLen+uLen], u[:uLen])
+				copy(buf[yLen+uLen:yLen+uLen+vLen], v[:vLen])
+				frame := yuvFrame{
+					destX: destX, destY: destY, w: w, h: h,
+					format:  yuvTextureFormat,
+					y:       buf[:yLen],
+					yStride: yStride,
+					u:       buf[yLen : yLen+uLen],
+					uStride: uStride,
+					v:       buf[yLen+uLen : yLen+uLen+vLen],
+					vStride: vStride,
+					buf:     buf,
+				}
+				select {
+				case yuvCh <- frame:
+				default:
+					yuvBufPool.Put(buf)
+					slog.Warn("yuv channel full, dropping I420 frame")
+					lastH264DropNs.Store(time.Now().UnixNano())
 				}
 				if bitmapEventType != sdl.FIRSTEVENT && eventPending.CompareAndSwap(false, true) {
 					sdl.PushEvent(wakeEvent)
@@ -1347,25 +977,16 @@ func mainLoop(hostPort, domain, user, password string, width, height int, swapAl
 			texture.Update(nil, unsafe.Pointer(&overlayZero[0]), int(w)*4)
 		}
 		if yuvTexture != nil {
-			drainPreLock()
 			yuvTexture.Destroy()
 			yuvTexture, rerr = renderer.CreateTexture(yuvTextureFormat, sdl.TEXTUREACCESS_STREAMING, w, h)
 			if rerr != nil {
 				slog.Warn("IYUV recreate failed after reconnect", "err", rerr)
 				yuvTexture = nil
-				yuvPrimaryPath = false
 			} else {
 				initYUVBlack(yuvTexture, int(w), int(h), yuvTextureFormat)
-				if stage, ok := preLockYUV(yuvTexture, int(w), int(h), yuvTextureFormat, true); ok {
-					yuvPrimaryPath = true
-					yuvStageCh <- stage
-				} else {
-					yuvPrimaryPath = false
-				}
 			}
 		}
 		yuvReady = false
-		yuvTextureIsNull = false
 		lastYUVFrameTime.Store(0)
 		fullScreenBitmapStartTime.Store(0)
 		lastFullScreenBitmapTime.Store(0)
@@ -1474,55 +1095,7 @@ func mainLoop(hostPort, domain, user, password string, width, height int, swapAl
 		eventPending.Store(false)
 
 		// Process H.264 YUV frames.
-		if yuvPrimaryPath {
-			// Primary path: the callback wrote directly into the pre-locked Metal
-			// staging buffer.  We just need to Unlock (which commits one Metal
-			// command buffer to blit the buffer into the YUV texture) and
-			// immediately re-lock so the staging buffer is ready for the next frame.
-			select {
-			case done := <-yuvDoneCh:
-				yuvTexture.Unlock() // GPU upload: grdp → MTLBuffer already done by callback
-				// Do NOT clear the overlay on null frames: null frames must not erase bitmap patches.
-				if !done.isNull {
-					clearOverlayDirty()
-				}
-				// Re-lock immediately so the next callback can write without waiting.
-				// Skip UV pre-initialisation when the last frame was full-texture:
-				// every UV byte was already overwritten by the callback, so Metal's
-				// staging buffer (even if freshly zeroed by the pool) has correct 4:2:0
-				// chroma.  For partial frames the init is still required to avoid green
-				// fringes (UV=0 ≈ RGB(0,136,0) in BT.601) in unwritten regions.
-				// After a null frame, always reinit (chroma must be set to 128).
-				needsChromaInit := !done.fullTexture || done.isNull
-				if stage, ok := preLockYUV(yuvTexture, width, height, yuvTextureFormat, needsChromaInit); ok {
-					select {
-					case yuvStageCh <- stage:
-					default:
-						// Channel already has a stage (shouldn't happen); release this one.
-						yuvTexture.Unlock()
-					}
-				} else {
-					slog.Warn("YUV pre-lock failed after frame, switching to fallback path")
-					yuvPrimaryPath = false
-				}
-				if !done.isNull {
-					// Null frames (VideoToolbox flush/init artifacts: Y=0,UV=0) are
-					// unlocked above to keep the pipeline moving, but not rendered —
-					// showing them would flash green for one display frame.
-					yuvReady = true
-					yuvTextureIsNull = false
-				} else {
-					yuvTextureIsNull = true
-				}
-				lastYUVFrameTime.Store(nowNs)
-				fullScreenBitmapStartTime.Store(0)
-				lastFullScreenBitmapTime.Store(0)
-				renderDirty = 3
-			default:
-			}
-		} else {
-			// Fallback path: drain pool-buffer frames copied by the callback and
-			// upload them with the Lock/copy/Unlock path (two copies total).
+		if yuvTexture != nil {
 			var latestYUV yuvFrame
 			haveYUV := false
 		drainYUV:
@@ -1539,19 +1112,11 @@ func mainLoop(hostPort, domain, user, password string, width, height int, swapAl
 				}
 			}
 			if haveYUV {
-				if latestYUV.isNull {
-					// Null frame (Y=0,UV=0): discard — uploading green data would flash
-					// through non-bitmap areas.  Keep the previous real frame visible.
-					yuvBufPool.Put(latestYUV.buf)
-					yuvTextureIsNull = true
-				} else {
-					clearOverlayDirty()
-					rect := sdl.Rect{X: int32(latestYUV.destX), Y: int32(latestYUV.destY), W: int32(latestYUV.w), H: int32(latestYUV.h)}
-					uploadYUVFrame(latestYUV, yuvTexture, &rect)
-					yuvBufPool.Put(latestYUV.buf)
-					yuvReady = true
-					yuvTextureIsNull = false
-				}
+				clearOverlayDirty()
+				rect := sdl.Rect{X: int32(latestYUV.destX), Y: int32(latestYUV.destY), W: int32(latestYUV.w), H: int32(latestYUV.h)}
+				uploadYUVFrame(latestYUV, yuvTexture, &rect)
+				yuvBufPool.Put(latestYUV.buf)
+				yuvReady = true
 				lastYUVFrameTime.Store(nowNs)
 				fullScreenBitmapStartTime.Store(0)
 				lastFullScreenBitmapTime.Store(0)
@@ -1615,12 +1180,12 @@ func mainLoop(hostPort, domain, user, password string, width, height int, swapAl
 			// Skip Clear when the YUV texture provides a full-screen base layer:
 			// renderer.Copy(yuvTexture, nil, nil) fills every pixel, making the
 			// prior Clear a wasted GPU command.  Clear is still needed for
-			// bitmap-only sessions and when the last decoded frame was null/missing.
-			if !yuvReady || yuvTextureIsNull {
+			// bitmap-only sessions.
+			if !yuvReady {
 				renderer.SetDrawColor(0, 0, 0, 255)
 				renderer.Clear()
 			}
-			if yuvReady && !yuvTextureIsNull {
+			if yuvReady {
 				renderer.Copy(yuvTexture, nil, nil)
 			}
 			// Skip the overlay copy when the texture is fully transparent —
@@ -1808,15 +1373,6 @@ func mainLoop(hostPort, domain, user, password string, width, height int, swapAl
 		if ap.reopenNeeded.CompareAndSwap(true, false) {
 			ap.reopen()
 		}
-	}
-
-	// Drain the pre-lock before the deferred cleanup (renderer.Destroy,
-	// yuvTexture.Destroy) frees the Metal staging buffer.  Without this,
-	// NV12 write goroutines spawned by the last callback invocation can
-	// still be running when renderer.Destroy() invalidates stage.all,
-	// causing a SIGSEGV (KERN_PROTECTION_FAILURE) in memmove.
-	if yuvTexture != nil && yuvPrimaryPath {
-		drainPreLock()
 	}
 
 	err = window.Destroy()
