@@ -113,98 +113,11 @@ func paintImages(bs []grdp.Bitmap, texture *sdl.Texture, width, height int, dirt
 }
 
 // uploadYUVFrame uploads a decoded H.264 YUV frame into the SDL2 YUV texture.
-//
-// On the SDL2 Metal renderer, SDL_UpdateNVTexture / SDL_UpdateYUVTexture each
-// allocate a separate staging MTLTexture per plane and commit two independent
-// Metal command buffers — a known inefficiency acknowledged by an SDL TODO
-// comment (src/render/metal/SDL_render_metal.m:710-711).
-//
-// SDL_LockTexture on the Metal backend instead allocates a single lightweight
-// MTLBuffer in shared (CPU+GPU unified) memory, lets us write both planes in
-// one Go pass, and uploads everything in a single command-buffer commit on
-// Unlock — halving GPU command overhead per frame.
-//
-// go-sdl2's Lock() computes the returned slice length as pitch×height (Y plane
-// only), omitting the chroma plane.  We extend the slice with unsafe.Slice so
-// we can write into the chroma region that SDL's MTLBuffer actually allocates.
-//
-// If Lock fails (e.g. software renderer fallback) we fall back to UpdateNV /
-// UpdateYUV which are equivalent in correctness.
 func uploadYUVFrame(frame yuvFrame, texture *sdl.Texture, rect *sdl.Rect) {
-	ph := (frame.h + 1) / 2
-
 	if frame.format == sdlPixelFormatNV12 {
-		pixels, pitch, err := texture.Lock(rect)
-		if err != nil {
-			texture.UpdateNV(rect, frame.y, frame.yStride, frame.uv, frame.uvStride)
-			return
-		}
-		defer texture.Unlock()
-		yLen := pitch * frame.h
-		uvLen := pitch * ph
-		// Extend the Y-only slice to cover the full NV12 MTLBuffer (Y + interleaved UV).
-		all := unsafe.Slice(&pixels[0], yLen+uvLen)
-		if pitch == frame.yStride {
-			total := yLen + uvLen
-			if total >= 256*256*4 {
-				var wg sync.WaitGroup
-				wg.Add(2)
-				go func() { defer wg.Done(); copy(all[:yLen], frame.y[:yLen]) }()
-				go func() { defer wg.Done(); copy(all[yLen:yLen+uvLen], frame.uv[:uvLen]) }()
-				wg.Wait()
-			} else {
-				copy(all[:yLen], frame.y[:yLen])
-				copy(all[yLen:yLen+uvLen], frame.uv[:uvLen])
-			}
-		} else {
-			w := frame.w
-			for row := 0; row < frame.h; row++ {
-				copy(all[row*pitch:row*pitch+w], frame.y[row*frame.yStride:])
-			}
-			for row := range ph {
-				copy(all[yLen+row*pitch:yLen+row*pitch+w], frame.uv[row*frame.uvStride:])
-			}
-		}
+		texture.UpdateNV(rect, frame.y, frame.yStride, frame.uv, frame.uvStride)
 	} else {
-		// I420 (IYUV): layout is Y | U | V with U/V each at half-width, half-height.
-		pixels, pitch, err := texture.Lock(rect)
-		if err != nil {
-			texture.UpdateYUV(rect, frame.y, frame.yStride, frame.u, frame.uStride, frame.v, frame.vStride)
-			return
-		}
-		defer texture.Unlock()
-		yLen := pitch * frame.h
-		uPitch := (pitch + 1) / 2
-		uvLen := uPitch * ph
-		// Extend slice to cover Y + U + V planes.
-		all := unsafe.Slice(&pixels[0], yLen+uvLen+uvLen)
-		if pitch == frame.yStride && uPitch == frame.uStride {
-			total := yLen + uvLen*2
-			if total >= 256*256*4 {
-				var wg sync.WaitGroup
-				wg.Add(3)
-				go func() { defer wg.Done(); copy(all[:yLen], frame.y[:yLen]) }()
-				go func() { defer wg.Done(); copy(all[yLen:yLen+uvLen], frame.u[:uvLen]) }()
-				go func() { defer wg.Done(); copy(all[yLen+uvLen:yLen+uvLen+uvLen], frame.v[:uvLen]) }()
-				wg.Wait()
-			} else {
-				copy(all[:yLen], frame.y[:yLen])
-				copy(all[yLen:yLen+uvLen], frame.u[:uvLen])
-				copy(all[yLen+uvLen:yLen+uvLen+uvLen], frame.v[:uvLen])
-			}
-		} else {
-			w := frame.w
-			hw := (frame.w + 1) / 2
-			for row := 0; row < frame.h; row++ {
-				copy(all[row*pitch:row*pitch+w], frame.y[row*frame.yStride:])
-			}
-			for row := range ph {
-				copy(all[yLen+row*uPitch:yLen+row*uPitch+hw], frame.u[row*frame.uStride:])
-			}
-			for row := range ph {
-				copy(all[yLen+uvLen+row*uPitch:yLen+uvLen+row*uPitch+hw], frame.v[row*frame.vStride:])
-			}
-		}
+		texture.UpdateYUV(rect, frame.y, frame.yStride, frame.u, frame.uStride, frame.v, frame.vStride)
 	}
 }
 
