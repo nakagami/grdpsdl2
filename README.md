@@ -107,3 +107,13 @@ the Alt key (and vice versa). Passing `-swap-alt-meta` enables this mapping.
 ```sh
 grdpsdl2 -swap-alt-meta
 ```
+
+#### `-disable-avc444`
+
+Disables AVC444 and AVC444v2 modes, falling back to AVC420 only for H.264 decoding.
+
+This can be useful if AVC444 decoding causes visual artifacts or performance issues with certain RDP servers or hardware configurations.
+
+```sh
+grdpsdl2 -disable-avc444
+```

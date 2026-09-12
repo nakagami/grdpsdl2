@@ -14,7 +14,6 @@ import (
 	"unsafe"
 
 	"github.com/nakagami/grdp"
-	_ "github.com/nakagami/grdp/plugin/rdpgfx/ffmpeg"
 	"github.com/nakagami/grdp/plugin/rdpsnd"
 	"github.com/veandco/go-sdl2/sdl"
 )
@@ -520,7 +519,8 @@ func mainLoop(hostPort, domain, user, password string, width, height int, swapAl
 	// Initialise texture to transparent now so blending is correct from the first frame.
 	texture.Update(nil, unsafe.Pointer(&overlayZero[0]), width*4)
 
-	bitmapCh := make(chan []grdp.Bitmap, 64)
+	var bitmapMu sync.Mutex
+	var pendingBitmaps []grdp.Bitmap
 	yuvCh := make(chan yuvFrame, 32)
 	yuvReady := false // true once any H264 frame has been rendered
 	clipboardFromServer := make(chan string, 4)
@@ -680,9 +680,10 @@ func mainLoop(hostPort, domain, user, password string, width, height int, swapAl
 		ap.reset()
 	}).OnBitmap(func(bs []grdp.Bitmap) {
 		lastServerActivity.Store(time.Now().UnixNano())
-		if len(bs) > 0 {
-			everShowedFrame.Store(true)
+		if len(bs) == 0 {
+			return
 		}
+		everShowedFrame.Store(true)
 		// Bitmap.Data is borrowed from grdp's internal pool; copy it before
 		// returning from this callback.  Reuse pooled buffers to avoid
 		// allocating fresh backing arrays on every frame.
@@ -697,20 +698,12 @@ func mainLoop(hostPort, domain, user, password string, width, height int, swapAl
 			copy(buf, src)
 			bs[i].Data = buf
 		}
-		sent := false
-		select {
-		case bitmapCh <- bs:
-			sent = true
-		default:
-			// Return buffers to pool since we're dropping this frame.
-			for i := range bs {
-				bitmapBufPool.Put(bs[i].Data)
-			}
-			slog.Warn("bitmap channel full, dropping frame")
-		}
+		bitmapMu.Lock()
+		pendingBitmaps = append(pendingBitmaps, bs...)
+		bitmapMu.Unlock()
 		// Wake the main loop immediately so it renders without waiting for
 		// WaitEventTimeout to expire.
-		if sent && bitmapEventType != sdl.FIRSTEVENT && eventPending.CompareAndSwap(false, true) {
+		if bitmapEventType != sdl.FIRSTEVENT && eventPending.CompareAndSwap(false, true) {
 			sdl.PushEvent(wakeEvent)
 		}
 	}).OnPointerHide(func() {
@@ -1105,15 +1098,12 @@ func mainLoop(hostPort, domain, user, password string, width, height int, swapAl
 		// eliminates catch-up lag on burst updates, and provides a larger batch
 		// for the bounding-rect Lock optimisation when it is re-enabled.
 		allBitmaps = allBitmaps[:0]
-	drainBitmaps:
-		for {
-			select {
-			case bs := <-bitmapCh:
-				allBitmaps = append(allBitmaps, bs...)
-			default:
-				break drainBitmaps
-			}
+		bitmapMu.Lock()
+		if len(pendingBitmaps) > 0 {
+			allBitmaps = append(allBitmaps, pendingBitmaps...)
+			pendingBitmaps = pendingBitmaps[:0]
 		}
+		bitmapMu.Unlock()
 		if len(allBitmaps) > 0 {
 			prevLen := len(overlayDirtyRects)
 			paintImages(allBitmaps, texture, width, height, &overlayDirtyRects)
